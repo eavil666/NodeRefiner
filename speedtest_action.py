@@ -37,6 +37,9 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
         
     proxies_to_load = []
     
+    # 1. 用于节点名称全域绝对去重与自动重命名的计数器
+    seen_names = {} 
+    
     # 内核支持的标准协议白名单
     SUPPORTED_TYPES = {
         'ss', 'shadowsocks', 'snell', 'vmess', 'vless', 
@@ -51,13 +54,13 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
         if not isinstance(p, dict):
             continue
             
-        node_name = str(p.get('name', '')).strip()
+        raw_name = str(p.get('name', '')).strip()
         ptype_lower = str(p.get('type', '')).strip().lower()
         
-        if not node_name or node_name == "None" or node_name == "":
+        if not raw_name or raw_name == "None" or raw_name == "":
             continue
             
-        # 核心防御 1：非白名单协议直接过滤
+        # 核心防御：非白名单协议直接过滤
         if ptype_lower not in SUPPORTED_TYPES:
             continue
 
@@ -74,7 +77,18 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
         if ptype_lower == 'shadowsocks': clean_proxy['type'] = 'ss'
         if ptype_lower == 'shadowsocksr': clean_proxy['type'] = 'ssr'
 
-        # 1. 字段名称平滑映射 (下划线转中划线)
+        # ✨【针对本次报错的致命防护】：全局节点名称去重与加编号重命名逻辑
+        if raw_name not in seen_names:
+            seen_names[raw_name] = 1
+            clean_proxy['name'] = raw_name
+        else:
+            # 发现同名碰撞，自动附加重名后缀编号（例如 🇸🇬 新加坡2_dup1）
+            count = seen_names[raw_name]
+            final_name = f"{raw_name}_dup{count}"
+            seen_names[raw_name] += 1
+            clean_proxy['name'] = final_name
+
+        # 2. 字段名称平滑映射 (下划线转中划线)
         if 'skip_cert_verify' in clean_proxy:
             clean_proxy['skip-cert-verify'] = clean_proxy.pop('skip_cert_verify')
         if 'private_key' in clean_proxy:
@@ -86,19 +100,16 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
         if 'obfs_password' in clean_proxy:
             clean_proxy['obfs-password'] = clean_proxy.pop('obfs_password')
 
-        # 2. 协议特异性健壮校验与防闪退熔断
+        # 3. 协议特异性健壮校验与防闪退熔断
         is_corrupted = False
         
-        # ✨【针对本次报错的致命防护】：强清洗 SSR 协议混淆缺陷
+        # 清洗 SSR 协议混淆缺陷
         if clean_proxy['type'] == 'ssr':
             ssr_obfs = str(clean_proxy.get('obfs', '')).strip().lower()
-            # 如果混淆为空、为 none 或者不在内核支持的白名单内，直接熔断抛弃该节点，防止 initialize obfs error 闪退
             if not ssr_obfs or ssr_obfs == 'none' or ssr_obfs not in VALID_SSR_OBFS:
                 is_corrupted = True
             else:
                 clean_proxy['obfs'] = ssr_obfs
-                
-            # 顺便强校验 ssr 的 protocol 字段
             if not str(clean_proxy.get('protocol', '')).strip():
                 clean_proxy['protocol'] = 'origin'
 
@@ -134,11 +145,10 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
             if not str(clean_proxy.get('private-key', '')).strip():
                 is_corrupted = True
 
-        # 如果触发协议层致命损坏，直接阻断，不载入配置
         if is_corrupted:
             continue
 
-        # 3. 混淆(obfs)字段净化 (针对标准 SS 协议)
+        # 4. 混淆(obfs)字段净化 (针对标准 SS 协议)
         if 'obfs' in clean_proxy and clean_proxy['type'] != 'ssr':
             obfs_type = str(clean_proxy['obfs']).strip().lower()
             if obfs_type and obfs_type != 'none':
@@ -152,7 +162,7 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
                     clean_proxy.pop('obfs', None)
                     clean_proxy.pop('obfs-password', None)
 
-        # 4. 彻底驯服 alpn 属性
+        # 5. 彻底驯服 alpn 属性
         if 'alpn' in clean_proxy and clean_proxy['alpn']:
             raw_alpn = clean_proxy['alpn']
             final_alpn = []
@@ -198,7 +208,7 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
     with open(config_path, "w", encoding="utf-8") as wf:
         yaml.dump(config, wf, allow_unicode=True, sort_keys=False)
     
-    print(f"📊 测速配置文件组装完毕，共成功清洗并载入 {len(proxies_to_load)} 个高规范节点。")
+    print(f"📊 测速配置文件组装完毕，共成功重命名冲突并载入 {len(proxies_to_load)} 个合规节点。")
     return True
 
 def run_speedtest():
@@ -241,7 +251,7 @@ def run_speedtest():
         try:
             proxies_res = requests.get(f"{API_URL}/proxies", timeout=5).json()
         except Exception as e:
-            print(f"❌ 通信异常，无法连接 to 本地内核 API: {e}")
+            print(f"❌ 通信异常，无法连接到本地内核 API: {e}")
             return
         
         proxies_dict = proxies_res.get("proxies", {})
@@ -269,7 +279,10 @@ def run_speedtest():
                     delay = res.json().get("delay", -1)
                     if delay > 0:
                         print(f"  ✅ [可用] {name} ── {delay}ms")
-                        share_link = link_mapping.get(name)
+                        
+                        # 映射逻辑兼容：如果是带重名后缀的节点（如 🇸🇬 新加坡2_dup1），回溯获取原始名字的分享链接
+                        lookup_name = name.split('_dup')[0]
+                        share_link = link_mapping.get(lookup_name, link_mapping.get(name, ''))
                         if share_link:
                             valid_nodes.append(share_link)
                 else:
