@@ -28,7 +28,6 @@ jobs:
 
     - name: ⚙️ 下载并安装 Mihomo (Clash.Meta) 内核
       run: |
-<<<<<<< HEAD
         # 1. 请求 GitHub API 获取最新的 release 数据，并提取出包含 'mihomo-linux-amd64' 且以 '.gz' 结尾的真实下载 URL
         DOWNLOAD_URL=$(curl -s https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | \
           jq -r '.assets[] | select(.name | test("mihomo-linux-amd64.*\\.gz$")) | .browser_download_url' | head -n 1)
@@ -61,13 +60,6 @@ jobs:
         chmod +x mihomo
         
         # 6. 验证内核是否安装成功并打印当前最新版本号
-=======
-        # 自动获取并下载适用于 Linux amd64 的最新版本 mihomo
-        curl -L -o mihomo.gz https://github.com/MetaCubeX/mihomo/releases/latest/download/mihomo-linux-amd64-compatible.gz
-        gunzip mihomo.gz
-        chmod +x mihomo
-        # 验证内核是否可用
->>>>>>> 85f3ad3543b00171dae1fc3be2832d2ede086fdc
         ./mihomo -v
 
     - name: 🏃 运行前置节点采集 (ProxyFlow-CI.py)
