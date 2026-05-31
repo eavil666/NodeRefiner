@@ -1,92 +1,122 @@
-name: 🚀 代理节点自动化测速
+name: 🌐 代理节点自动化抓取与测速
 
 on:
-  push:
-    branches:
-      - main  # 当你向 main 分支 push 代码时触发
+  # 触发机制 1：定时任务（例如每 6 小时自动触发一次）
   schedule:
-    - cron: '0 */6 * * *'  # 🕒 进阶：每 6 小时自动在后台跑一次测试（可选）
-  workflow_dispatch:      # 允许你在 GitHub 网页上点击按钮手动触发
+    - cron: '0 */6 * * *'
+  # 触发机制 2：支持手动点击一键触发
+  workflow_dispatch:
+
+# 赋予工作流清除历史运行记录、提交归档文件所需的最高权限
+permissions:
+  actions: write
+  contents: write
 
 jobs:
-  speedtest:
-    runs-on: ubuntu-latest  # 使用 GitHub 提供的免费 Linux 环境
+  automation_flow:
+    runs-on: ubuntu-latest
 
     steps:
-    - name: 📥 拉取最新代码
-      uses: actions/checkout@v4
+      - name: 📥 检出代码仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 完整检出分支历史
 
-    - name: 🐍 初始化 Python 环境
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.10'
+      - name: 🐍 部署 Python 运行环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
 
-    - name: 📦 安装 Python 依赖库
-      run: |
-        python -m pip install --upgrade pip
-        pip install requests pyyaml
+      - name: 📦 安装流水线依赖组件
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pyyaml urllib3
 
-    - name: ⚙️ 下载并安装 Mihomo (Clash.Meta) 内核
-      run: |
-        # 1. 请求 GitHub API 获取最新的 release 数据，并提取出包含 'mihomo-linux-amd64' 且以 '.gz' 结尾的真实下载 URL
-        DOWNLOAD_URL=$(curl -s https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | \
-          jq -r '.assets[] | select(.name | test("mihomo-linux-amd64.*\\.gz$")) | .browser_download_url' | head -n 1)
-        
-        # 打印提取到的链接，方便在日志中对齐检查
-        echo "🌐 探测到最新内核下载链接: $DOWNLOAD_URL"
-        
-        # 2. 如果 API 限制或提取失败，使用兜底的标准 Latest 直链
-        if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" = "null" ]; then
-          echo "⚠️ API 提取失败，正在启动官方 Latest 直链同步机制..."
-          DOWNLOAD_URL="https://github.com/MetaCubeX/mihomo/releases/latest/download/mihomo-linux-amd64.gz"
-        fi
+      - name: 🚀 步骤 1：执行全网订阅源抓取与去重清洗
+        run: |
+          if [ -f "ProxyFlow-CI.py" ]; then
+            python ProxyFlow-CI.py
+          else
+            echo "❌ 错误: 找不到抓取主脚本 ProxyFlow-CI.py！"
+            exit 1
+          fi
 
-        # 3. 执行高稳定下载
-        curl -L -o mihomo.gz "$DOWNLOAD_URL"
+      - name: ⚙️ 步骤 2：下载并配置最新版 Mihomo (Clash.Meta) 内核
+        run: |
+          echo "正在获取 Mihomo Linux-AMD64 稳定版内核..."
+          # 从官方 Alpha 或 Release 分支拉取纯净二进制文件
+          curl -L -o mihomo.tar.gz https://github.com/MetaCubeX/Mihomo/releases/download/v1.18.9/mihomo-linux-amd64-v1.18.9.tar.gz
+          tar -xzf mihomo.tar.gz
+          mv mihomo-linux-amd64 mihomo
+          chmod +x mihomo
+          echo "✅ Mihomo 内核就绪。"
 
-        # 4. 检查下载回来的文件类型（确保不是 404 网页）
-        FILE_TYPE=$(file -b mihomo.gz)
-        echo "📦 下载文件的实际类型为: $FILE_TYPE"
+      - name: ⚡ 步骤 3：拉起并发内核并下发初筛测速
+        run: |
+          if [ -f "speedtest_action.py" ]; then
+            python speedtest_action.py
+          else
+            echo "❌ 错误: 找不到测速脚本 speedtest_action.py！"
+            exit 1
+          fi
 
-        # 5. 解压并赋予执行权限
-        # 如果下载下来的是真正的 gzip，用 gzip 解压；如果是直接的二进制，则改名
-        if [[ "$FILE_TYPE" == *"gzip compressed"* ]]; then
-          gzip -d -c mihomo.gz > mihomo
-        else
-          echo "⚠️ 检测到下载的并非 gz 压缩包，可能是直接的二进制流，正在直接转换..."
-          mv mihomo.gz mihomo
-        fi
-        
-        chmod +x mihomo
-        
-        # 6. 验证内核是否安装成功并打印当前最新版本号
-        ./mihomo -v
+      - name: 📂 步骤 4：按照当天日期建立文件夹并归档数据
+        run: |
+          # 1. 设置时区为东八区（北京时间），获取当前日期
+          TZ='Asia/Shanghai' CURRENT_DATE=$(date +%Y-%m-%d)
+          ARCHIVE_DIR="archived/${CURRENT_DATE}"
+          
+          echo "🕒 当前北京时间日期: ${CURRENT_DATE}"
+          echo "📁 正在创建归档目标目录: ${ARCHIVE_DIR}"
+          mkdir -p "${ARCHIVE_DIR}"
+          
+          # 2. 健壮性文件备份：如果生成了测速结果，则强行拷贝到归档目录中
+          if [ -f "valid_links.txt" ]; then
+            cp "valid_links.txt" "${ARCHIVE_DIR}/valid_links.txt"
+            echo "✅ 成功归档 valid_links.txt 到 ${ARCHIVE_DIR}/"
+          else
+            echo "⚠️ 警告: 未找到有效的 valid_links.txt 结果文件，跳过该项归档。"
+          fi
+          
+          if [ -f "all_proxies.json" ]; then
+            cp "all_proxies.json" "${ARCHIVE_DIR}/all_proxies.json"
+            echo "✅ 成功归档全局纯净去重库 all_proxies.json 到 ${ARCHIVE_DIR}/"
+          fi
 
-    - name: 🏃 运行前置节点采集 (ProxyFlow-CI.py)
-      run: |
-        # 确保存在 urls.txt，然后运行你的采集脚本生成 all_proxies.json 和 all_links.txt
-        if [ -f "urls.txt" ]; then
-          python ProxyFlow-CI.py
-        else
-          echo "⚠️ 找不到 urls.txt，请确保仓库中包含该文件"
-          exit 1
-        fi
+      - name: ⬆️ 步骤 5：同步并推送到 GitHub 仓库
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git add valid_links.txt archived/
+          
+          # 只有当文件发生实质性改动时才提交，防止 Actions 报空提交错误
+          if git diff --staged --quiet; then
+            echo "✨ 节点无任何变动，无需提交代码。"
+          else
+            git commit -m "🌐 自动化初筛报告: $(date -d 'today' +'%Y-%m-%d %H:%M:%S') (自动按日期归档)"
+            git push origin main
+          fi
 
-    - name: ⚡ 运行 Mihomo 路由测速脚本
-      run: |
-        # 运行测速脚本（需配合下方修改后的 Python 脚本）
-        python speedtest_action.py
-
-    - name: 💾 将可用节点与测试结果提交回仓库
-      run: |
-        git config --global user.name "GitHub Actions Bot"
-        git config --global user.email "actions@github.com"
-        
-        # 检查是否有文件发生变动
-        git add .
-        if git diff --staged --quiet; then
-          echo "🎉 没有发现新数据变动，无需提交。"
-        else
-          git commit -m "🤖 自动同步: 更新节点有效性测试报告 [skip ci]"
-          git push
-        fi
+      - name: 🧹 步骤 6：利用 GitHub CLI 清理历史 Workflow Runs（仅保留最新一条）
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "🔍 正在扫描本工作流的历史运行记录..."
+          
+          # 获取当前正在运行的 Workflow Run ID，防止误伤自己
+          CURRENT_RUN_ID="${{ github.run_id }}"
+          
+          # 使用 GitHub 官方原生 CLI 获取除了当前这条外，所有历史运行的 ID 列表（最多扫描前 100 条历史）
+          RUN_IDS=$(gh run list --workflow "${{ github.workflow }}" --limit 100 --json databaseId -q ".[].databaseId" | grep -v "$CURRENT_RUN_ID")
+          
+          if [ -z "$RUN_IDS" ]; then
+            echo "🎉 仓库非常纯净，没有发现需要清理的历史运行记录。"
+          else
+            echo "发现历史冗余运行记录，开始执行毁灭性熔断清理..."
+            for RUN_ID in $RUN_IDS; do
+              echo "🗑️ 正在抹除历史 Workflow Run ID: ${RUN_ID}"
+              gh run delete "$RUN_ID" || true
+            done
+            echo "✅ 历史清理完毕！Actions 页面已实现『仅保留最新一条』记录。"
+          fi
