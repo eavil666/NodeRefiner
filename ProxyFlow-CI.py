@@ -65,10 +65,8 @@ class ProxyInfo:
         elif ptype in ['vmess', 'vless']:
             data = f"{self.type}|{self.server}|{self.port}|{self.uuid}"
         elif ptype in ['hysteria2', 'hy2', 'trojan', 'socks5', 'http']:
-            # 使用密码/核心Token作为去重依据
             data = f"{ptype}|{self.server}|{self.port}|{self.password}"
         elif ptype in ['tuic', 'anytls']:
-            # 这些协议可能同时包含 UUID 或密码，进行复合提取
             auth = self.uuid or self.password
             data = f"{ptype}|{self.server}|{self.port}|{auth}"
         elif ptype == 'ss':
@@ -79,19 +77,17 @@ class ProxyInfo:
         return hashlib.md5(data.encode('utf-8')).hexdigest()
     
     def to_share_link(self) -> str:
-        """【✨ 核心修复】将自身属性转换为标准客户端一键导入分享链接（支持新协议）"""
+        """将自身属性转换为标准客户端一键导入分享链接"""
         ptype = self.type.lower()
         name_encoded = quote(self.name)
         
-        # 1. 新增：Hysteria2 / Hy2 分支代入
         if ptype in ['hysteria2', 'hy2']:
             params = {}
-            if self.host: params['obfs'] = self.host  # Clash YAML中obfs常映射到host或单独处理
+            if self.host: params['obfs'] = self.host  
             if self.sni: params['sni'] = self.sni
             query = '&'.join([f"{k}={quote(str(v))}" for k, v in params.items() if v])
             return f"hysteria2://{self.password}@{self.server}:{self.port}" + (f"?{query}" if query else "") + f"#{name_encoded}"
             
-        # 2. 新增：TUIC 分支代入
         elif ptype == 'tuic':
             params = {
                 'alpn': self.alpn or 'h3',
@@ -101,7 +97,6 @@ class ProxyInfo:
             query = '&'.join([f"{k}={quote(str(v))}" for k, v in params.items() if v])
             return f"tuic://{auth}@{self.server}:{self.port}?{query}#{name_encoded}"
             
-        # 3. 新增：AnyTLS 分支代入
         elif ptype == 'anytls':
             params = {
                 'sni': self.sni or self.server,
@@ -111,7 +106,6 @@ class ProxyInfo:
             query = '&'.join([f"{k}={quote(str(v))}" for k, v in params.items() if v])
             return f"anytls://{auth}@{self.server}:{self.port}?{query}#{name_encoded}"
 
-        # 4. 保留并升级原有协议分支
         elif ptype in ['wireguard', 'wg']:
             params = {
                 'privateKey': self.private_key,
@@ -211,7 +205,6 @@ class ProxyInfo:
         return None
 
     def to_dict(self) -> Dict[str, Any]:
-        """转换为字典"""
         return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
 
 class DuplicateManager:
@@ -319,13 +312,6 @@ class YAMLConfigProcessor:
         return any(indicator in content.lower() for indicator in proxy_indicators)
     
     def get_config_from_url(self, url: str) -> Optional[str]:
-        """
-        全兼容高智能网络获取核心算法
-        - 支持 HTTP/HTTPS 协议无缝转换和状态自适应
-        - HEAD 方法高速探测死链与301/302重定向
-        - 智能防屏蔽 (HEAD ➔ GET 方法自愈降级)
-        - SSL 级联安全自调整降级保护
-        """
         if self.skip_processed_urls and self.dup_manager.is_url_processed(url):
             logger.info(f"⏭️ 跳过历史已成功处理的URL: {url}")
             return None
@@ -339,7 +325,6 @@ class YAMLConfigProcessor:
                 current_timeout = self.timeout if attempt > 0 else 5.0
                 logger.info(f"🔍 [{attempt + 1}/{self.retry_count + 1}] 正在智能探测源: {normalized_url}")
                 
-                # ── 阶段一：发轻量级 HEAD 请求 ──
                 probe = self.session.head(
                     normalized_url, 
                     timeout=current_timeout,
@@ -356,7 +341,6 @@ class YAMLConfigProcessor:
                     if 'text/html' in content_type:
                         logger.debug(f"⚠️ 探测到内容类型为 HTML，可能已被重定向到报错或人机验证页")
 
-                # ── 阶段二：精准 GET 获取数据 ──
                 response = self.session.get(
                     normalized_url, 
                     timeout=self.timeout,
@@ -421,9 +405,93 @@ class YAMLConfigProcessor:
                 if ':' in stripped and not stripped.startswith(('<', '{', '[')) and len(stripped.split(':')) >= 2:
                     cleaned_lines.append(line)
         return '\n'.join(cleaned_lines)
+
+    # ✨✨✨【核心新规：前置清洗熔断过滤器】✨✨✨
+    def validate_and_clean_proxy_dict(self, proxy: dict, idx: int, source_url: str) -> Tuple[bool, Optional[dict]]:
+        """
+        在提取和组装 ProxyInfo 实体之前进行严格的语法与协议强校验。
+        返回 (是否合格, 清洗纠正后的数据字典)
+        """
+        if not isinstance(proxy, dict):
+            return False, None
+
+        ptype = str(proxy.get('type', '')).strip().lower()
+        server_addr = str(proxy.get('server', '') or proxy.get('ip', '')).strip()
+        name_val = str(proxy.get('name', '')).strip()
+
+        # 1. 必填骨架校验
+        if not ptype or not server_addr or not name_val:
+            logger.debug(f"⏭️ [源头熔断] 节点(索引:{idx}) 缺少 type, server 或 name 基本属性，予以丢弃。")
+            return False, None
+
+        # 2. 端口强合规校验
+        try:
+            port_val = int(proxy.get('port', 0))
+            if port_val <= 0 or port_val > 65535:
+                logger.warning(f"⚠️ [源头熔断] 节点 '{name_val}' 端口范围不合法: {port_val}，自动隔离。")
+                return False, None
+            proxy['port'] = port_val
+        except:
+            logger.warning(f"⚠️ [源头熔断] 节点 '{name_val}' 端口解析异常，自动隔离。")
+            return False, None
+
+        # 3. WireGuard (wg) 专属核心字段熔断与格式收敛
+        if ptype in ['wireguard', 'wg']:
+            # 兼容带有中划线和下划线的两种写法并收敛
+            private_key = str(proxy.get('private-key', proxy.get('private_key', ''))).strip()
+            if not private_key or private_key.lower() == "none":
+                logger.warning(f"⚠️ [源头熔断] WG节点 '{name_val}' 缺失核心秘钥 private-key，阻止其进入测速流。")
+                return False, None
+            proxy['private-key'] = private_key # 确保统一使用中划线命名兼容Mihomo
+
+            # 驯服局域网虚拟本端 IP (Clash规范中映射到 'ip' 字段且强校验必须为单字符串)
+            ip_field = proxy.get('ip', '10.0.0.2')
+            if isinstance(ip_field, list):
+                if len(ip_field) > 0:
+                    proxy['ip'] = str(ip_field[0]).strip()
+                else:
+                    proxy['ip'] = "10.0.0.2"
+            else:
+                proxy['ip'] = str(ip_field).strip()
+            
+            if not proxy['ip'] or proxy['ip'].lower() == "none":
+                proxy['ip'] = "10.0.0.2"
+
+        # 4. Vmess 专属核心字段 alterId 自动对齐强补全
+        elif ptype == 'vmess':
+            try:
+                proxy['alterId'] = int(proxy.get('alterId', 0))
+            except:
+                proxy['alterId'] = 0
+
+        # 5. 跨协议高危传输层字段 alpn 类型擦除与 Slice 级联对齐
+        if 'alpn' in proxy and proxy['alpn']:
+            raw_alpn = proxy['alpn']
+            processed_alpn = []
+            if isinstance(raw_alpn, list):
+                processed_alpn = [str(item).strip() for item in raw_alpn if item]
+            elif isinstance(raw_alpn, str):
+                if ',' in raw_alpn:
+                    processed_alpn = [item.strip() for item in raw_alpn.split(',') if item.strip()]
+                else:
+                    processed_alpn = [raw_alpn.strip()]
+            
+            if processed_alpn:
+                # 转换为标准 Clash/Mihomo 的多元素标量数组格式
+                proxy['alpn'] = processed_alpn
+            else:
+                # 如果转换出来是脏数据列表，直接剔除，使其走内核握手缺省，防止断言闪退
+                if 'alpn' in proxy: del proxy['alpn']
+
+        # 6. 清理可能引起内核类型映射失败的空白字符串
+        for uncompliant_key in ['sni', 'host', 'path']:
+            if uncompliant_key in proxy and (proxy[uncompliant_key] == "" or proxy[uncompliant_key] is None):
+                del proxy[uncompliant_key]
+
+        return True, proxy
     
     def extract_all_proxies(self, config_content: str, source_url: str) -> List[ProxyInfo]:
-        """从拉取的 YAML 配置中精准提取代理项"""
+        """从拉取的 YAML 配置中精准提取代理项（已集成前置强校验机制）"""
         all_proxies = []
         try:
             config_data = None
@@ -440,52 +508,52 @@ class YAMLConfigProcessor:
             proxies = config_data['proxies']
             if not isinstance(proxies, list): return all_proxies
             
-            for proxy in proxies:
+            for idx, proxy in enumerate(proxies):
                 try:
-                    ptype = str(proxy.get('type', '')).lower()
-                    server_addr = str(proxy.get('server', '') or proxy.get('ip', ''))
-                    
-                    # ✨ 深度兼容新协议专属字段
-                    private_key = str(proxy.get('private-key', ''))
-                    public_key = str(proxy.get('public-key', ''))
-                    preshared_key = str(proxy.get('preshared-key', ''))
+                    # ✨ [调用前置过滤器] 在这里拦截、清洗与熔断
+                    is_pass, cleaned_proxy = self.validate_and_clean_proxy_dict(proxy, idx, source_url)
+                    if not is_pass or not cleaned_proxy:
+                        continue # 被安全隔离熔断，直接跳过处理下一个节点
+
+                    ptype = cleaned_proxy['type'].lower()
+                    server_addr = cleaned_proxy['server']
                     
                     # 局域网虚拟客户端 IP / Reserved 数据集数组处理
-                    ip_field = proxy.get('ip', '')
+                    ip_field = cleaned_proxy.get('ip', '')
                     if isinstance(ip_field, list): ip_field = ",".join(ip_field)
-                    reserved_field = proxy.get('reserved', '')
+                    reserved_field = cleaned_proxy.get('reserved', '')
                     if isinstance(reserved_field, list): reserved_field = ",".join(map(str, reserved_field))
                     
                     proxy_info = ProxyInfo(
-                        name=str(proxy.get('name', 'Node')),
-                        type=ptype,
+                        name=cleaned_proxy['name'],
+                        type=cleaned_proxy['type'],
                         server=server_addr,
-                        port=int(proxy.get('port', 0)),
-                        cipher=str(proxy.get('cipher', '')),
-                        password=str(proxy.get('password', '')),
-                        uuid=str(proxy.get('uuid', '')),
-                        network=str(proxy.get('network', '')),
-                        tls=bool(proxy.get('tls', False)),
-                        udp=bool(proxy.get('udp', True)),
-                        alterId=int(proxy.get('alterId', 0)),
-                        sni=str(proxy.get('sni', '')),
-                        host=ip_field if ptype in ['wireguard', 'wg'] else str(proxy.get('host', '')),
-                        path=str(proxy.get('path', '')),
-                        security=str(proxy.get('security', '')),
-                        scy=str(proxy.get('scy', '')),
-                        alpn=str(proxy.get('alpn', '')),
-                        skip_cert_verify=bool(proxy.get('skip-cert-verify', False)),
+                        port=cleaned_proxy['port'],
+                        cipher=str(cleaned_proxy.get('cipher', '')),
+                        password=str(cleaned_proxy.get('password', '')),
+                        uuid=str(cleaned_proxy.get('uuid', '')),
+                        network=str(cleaned_proxy.get('network', '')),
+                        tls=bool(cleaned_proxy.get('tls', False)),
+                        udp=bool(cleaned_proxy.get('udp', True)),
+                        alterId=int(cleaned_proxy.get('alterId', 0)),
+                        sni=str(cleaned_proxy.get('sni', '')),
+                        host=ip_field if ptype in ['wireguard', 'wg'] else str(cleaned_proxy.get('host', '')),
+                        path=str(cleaned_proxy.get('path', '')),
+                        security=str(cleaned_proxy.get('security', '')),
+                        scy=str(cleaned_proxy.get('scy', '')),
+                        alpn=cleaned_proxy.get('alpn', ''), # 已在上面规范化为列表或彻底清除
+                        skip_cert_verify=bool(cleaned_proxy.get('skip-cert-verify', False)),
                         source_url=source_url,
-                        private_key=private_key,
-                        public_key=public_key,
-                        preshared_key=preshared_key,
+                        private_key=str(cleaned_proxy.get('private-key', '')),
+                        public_key=str(cleaned_proxy.get('public-key', '')),
+                        preshared_key=str(cleaned_proxy.get('preshared-key', '')),
                         reserved=str(reserved_field),
-                        mtu=int(proxy.get('mtu', 1420))
+                        mtu=int(cleaned_proxy.get('mtu', 1420))
                     )
                     all_proxies.append(proxy_info)
                 except Exception as e:
                     logger.error(f"构造代理实体发生细节异常: {e}, 略过损坏节点数据项")
-            logger.info(f"节点映射成功 ── 成功转化 {len(all_proxies)} 个可用节点实体")
+            logger.info(f"节点映射成功 ── 成功安全转化 {len(all_proxies)} 个高规范可用节点实体")
         except Exception as e:
             logger.error(f"提取代理元数据数组发生阻断: {e}")
         return all_proxies
