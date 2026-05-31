@@ -36,12 +36,27 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
             return False
         
     proxies_to_load = []
+    
+    # 支持的标准内核协议白名单
+    SUPPORTED_TYPES = {
+        'ss', 'shadowsocks', 'snell', 'vmess', 'vless', 
+        'trojan', 'hysteria', 'hysteria2', 'hy2', 'tuic', 
+        'wireguard', 'wg', 'ssr', 'shadowsocksr', 'socks5', 'http'
+    }
+
     for idx, p in enumerate(json_proxies):
         if not isinstance(p, dict):
             continue
             
+        # 0. 严格阻断无名或残缺幽灵节点
         node_name = str(p.get('name', '')).strip()
-        if not node_name or node_name == "None":
+        ptype_lower = str(p.get('type', '')).strip().lower()
+        
+        if not node_name or node_name == "None" or node_name == "":
+            continue
+            
+        # ✨【核心防御 1】：非白名单标准协议，直接拦截，防止不认识的空协议让内核崩溃
+        if ptype_lower not in SUPPORTED_TYPES:
             continue
 
         # 提取纯净的核心代理属性
@@ -50,6 +65,12 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
             if k not in ['fingerprint', 'timestamp', 'share_link', 'xray_config', 'source_urls', 'source_url']
         }
         
+        # 修复规范化协议名称
+        clean_proxy['type'] = ptype_lower
+        if ptype_lower == 'wg': clean_proxy['type'] = 'wireguard'
+        if ptype_lower == 'hy2': clean_proxy['type'] = 'hysteria2'
+        if ptype_lower == 'shadowsocks': clean_proxy['type'] = 'ss'
+
         # 1. 字段名称平滑映射 (下划线转中划线)
         if 'skip_cert_verify' in clean_proxy:
             clean_proxy['skip-cert-verify'] = clean_proxy.pop('skip_cert_verify')
@@ -62,45 +83,67 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
         if 'obfs_password' in clean_proxy:
             clean_proxy['obfs-password'] = clean_proxy.pop('obfs_password')
 
-        # 2. ✨【针对本次报错的防御】：对混淆(obfs)字段进行终极清洗
-        if 'obfs' in clean_proxy:
-            obfs_type = str(clean_proxy['obfs']).strip().lower()
-            if obfs_type and obfs_type != 'none':
-                # 检查是否存在密码
-                has_password = False
-                if 'obfs-password' in clean_proxy and str(clean_proxy['obfs-password']).strip():
-                    has_password = True
-                elif isinstance(clean_proxy.get('plugin-opts'), dict) and str(clean_proxy['plugin-opts'].get('password', '')).strip():
-                    has_password = True
-                
-                # 如果开启了混淆但没有密码，强行剔除 obfs 键值对，保护内核不闪退
-                if not has_password:
-                    clean_proxy.pop('obfs', None)
-                    clean_proxy.pop('obfs-password', None)
-
-        # 3. 协议特异性强补全与逻辑防御
-        ptype_lower = str(clean_proxy.get('type', '')).lower()
+        # 2. ✨【核心防御 2】：针对各协议鉴权和传输残缺字段进行毁灭性熔断检查
+        is_corrupted = False
         
+        # 针对 TUIC 协议的防闪退彻底净化
+        if clean_proxy['type'] == 'tuic':
+            # 获取凭证，tuic 核心必须要有 token/password/uuid 之一
+            uuid_val = str(clean_proxy.get('uuid', clean_proxy.get('password', clean_proxy.get('token', '')))).strip()
+            if not uuid_val or uuid_val == "None":
+                is_corrupted = True # 缺凭证，标记损坏
+            else:
+                clean_proxy['uuid'] = uuid_val
+                # 显式补全 TUIC 所需的核心空缺默认字段，防止报 unset fields
+                if 'port' not in clean_proxy: clean_proxy['port'] = 443
+                
+            # 彻底拔除干扰内核自动推导 transport 的多余残缺字段
+            clean_proxy.pop('transport', None)
+            clean_proxy.pop('username', None)
+
+        # 针对 Hysteria / Hysteria2 协议的防闪退净化
+        elif clean_proxy['type'] in ['hysteria', 'hysteria2']:
+            if not str(clean_proxy.get('password', '')).strip() or clean_proxy.get('password') == "None":
+                is_corrupted = True
+
+        # 针对 Vmess / Vless 协议的防闪退净化
+        elif clean_proxy['type'] in ['vmess', 'vless']:
+            if not str(clean_proxy.get('uuid', '')).strip() or clean_proxy.get('uuid') == "None":
+                is_corrupted = True
+
         # 针对 WireGuard 补全本地地址
-        if ptype_lower in ['wireguard', 'wg']:
+        elif clean_proxy['type'] == 'wireguard':
             if 'ip' not in clean_proxy or not str(clean_proxy['ip']).strip() or clean_proxy['ip'] == "None":
                 if 'host' in clean_proxy and str(clean_proxy['host']).strip() and clean_proxy['host'] != "None":
                     clean_proxy['ip'] = clean_proxy['host']
                 else:
                     clean_proxy['ip'] = "10.0.0.2"
             clean_proxy.pop('host', None)
+            if not str(clean_proxy.get('private-key', '')).strip():
+                is_corrupted = True
 
-        # 针对 TUIC 协议的鉴权映射
-        elif ptype_lower == 'tuic':
-            if 'uuid' not in clean_proxy and 'password' in clean_proxy:
-                clean_proxy['uuid'] = clean_proxy['password']
-            clean_proxy.pop('transport', None)
+        # 如果节点在上面被检测出关键认证字段不齐，直接丢弃，不载入测速
+        if is_corrupted:
+            continue
+
+        # 3. 混淆(obfs)字段净化
+        if 'obfs' in clean_proxy:
+            obfs_type = str(clean_proxy['obfs']).strip().lower()
+            if obfs_type and obfs_type != 'none':
+                has_password = False
+                if 'obfs-password' in clean_proxy and str(clean_proxy['obfs-password']).strip():
+                    has_password = True
+                elif isinstance(clean_proxy.get('plugin-opts'), dict) and str(clean_proxy['plugin-opts'].get('password', '')).strip():
+                    has_password = True
+                
+                if not has_password:
+                    clean_proxy.pop('obfs', None)
+                    clean_proxy.pop('obfs-password', None)
 
         # 4. 彻底驯服 alpn 属性
         if 'alpn' in clean_proxy and clean_proxy['alpn']:
             raw_alpn = clean_proxy['alpn']
             final_alpn = []
-            
             if isinstance(raw_alpn, list):
                 final_alpn = [str(x).strip() for x in raw_alpn if x]
             elif isinstance(raw_alpn, str):
@@ -108,7 +151,6 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
                     final_alpn = [x.strip() for x in raw_alpn.split(',') if x.strip()]
                 else:
                     final_alpn = [raw_alpn.strip()]
-            
             if final_alpn:
                 clean_proxy['alpn'] = final_alpn
             else:
@@ -119,7 +161,7 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
         proxies_to_load.append(clean_proxy)
 
     if not proxies_to_load:
-        print("⚠️ 警告: 过滤后无有效代理节点，跳过本次测速。")
+        print("⚠️ 警告: 经过协议指纹过滤后无任何有效代理节点，跳过本次测速。")
         return False
 
     config = {
@@ -144,7 +186,7 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
     with open(config_path, "w", encoding="utf-8") as wf:
         yaml.dump(config, wf, allow_unicode=True, sort_keys=False)
     
-    print(f"📊 测速配置文件组装完毕，共载入 {len(proxies_to_load)} 个绝对合规的代理节点。")
+    print(f"📊 测速配置文件组装完毕，共过滤并成功载入 {len(proxies_to_load)} 个绝对合规的代理节点。")
     return True
 
 def run_speedtest():
