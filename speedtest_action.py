@@ -3,12 +3,24 @@ import time
 import json
 import os
 import requests
+import socket
 from urllib.parse import quote
 
 # ⚙️ Linux 环境配置
-MIHOMO_PATH = "./mihomo"  # 👈 Actions 中解压后的 Linux 执行文件名
+MIHOMO_PATH = "./mihomo"
 CONTROLLER_PORT = 9090
 API_URL = f"http://127.0.0.1:{CONTROLLER_PORT}"
+
+def is_port_open(port: int, host: str = "127.0.0.1") -> bool:
+    """用原生 Socket 检查指定端口是否已经开放监听"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(1)
+    try:
+        s.connect((host, port))
+        s.close()
+        return True
+    except:
+        return False
 
 def generate_temp_config(config_path: str = "temp_mihomo_config.yaml"):
     """读取 processor1.py 生成的 all_proxies.json，构建临时 Clash 配置文件"""
@@ -21,15 +33,15 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml"):
         "socks-port": 7891,
         "allow-lan": False,
         "mode": "rule",
-        "log-level": "silent",
+        "log-level": "info", # 💡 调低日志等级，方便在 Actions 报错时排查
         "external-controller": f"127.0.0.1:{CONTROLLER_PORT}",
+        "secret": "",        # 确保不设密码，方便 API 直接调用
         "proxies": []
     }
 
     with open("all_proxies.json", "r", encoding="utf-8") as jf:
         json_proxies = json.load(jf)
         for p in json_proxies:
-            # 清洗字典，只保留 mihomo 原生支持的字段
             clean_proxy = {k: v for k, v in p.items() if k not in ['fingerprint', 'timestamp', 'share_link', 'xray_config', 'source_urls']}
             config["proxies"].append(clean_proxy)
 
@@ -49,31 +61,53 @@ def run_speedtest():
     if not generate_temp_config(config_file):
         return
 
+    # 💡 核心预防：在 Linux 下创建一个虚拟的空工作目录，防止 mihomo 因为找不到/去下载 GeoIP 数据库而闪退
+    os.makedirs("clash_dummy", exist_ok=True)
+    with open("clash_dummy/Country.mmdb", "w") as f:
+        f.write("") # 写入空数据骗过内核的初始化检查
+
     print("🚀 正在启动后台 Mihomo 内核进程...")
     process = None
     try:
-        # 在 Linux 平台下安全启动进程
+        # 💡 升级启动方式：把 stdout/stderr 写入本地临时文件，如果连不上可以打印日志排查
+        log_file = open("mihomo_kernel.log", "w")
         process = subprocess.Popen(
-            [MIHOMO_PATH, "-f", config_file],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
+            [MIHOMO_PATH, "-f", config_file, "-d", "./clash_dummy"], # 指定配置与工作目录
+            stdout=log_file,
+            stderr=log_file
         )
-        time.sleep(3)  # 给内核留足启动时间
+        
+        # 💡 智能弹性连接：不再死等 3 秒，每隔 1 秒探测一次端口，最多等 15 秒
+        print("⏳ 正在等待 Mihomo 外部控制器 (API) 端口开放...")
+        api_ready = False
+        for i in range(15):
+            if is_port_open(CONTROLLER_PORT):
+                print(f"✅ Mihomo API 端口已成功在第 {i+1} 秒激活！")
+                api_ready = True
+                break
+            time.sleep(1)
+            
+        if not api_ready:
+            print("❌ 严重错误: Mihomo 内核在 15 秒内未能成功监听 9090 端口！")
+            # 读取并打印内核的真实崩溃日志
+            if os.path.exists("mihomo_kernel.log"):
+                print("\n📋 ─── 以下为 Mihomo 内核崩溃日志 ───")
+                with open("mihomo_kernel.log", "r") as lf:
+                    print(lf.read())
+            return
         
         print("⚡ 开始发送高并发延迟测试指令...")
         try:
             proxies_res = requests.get(f"{API_URL}/proxies", timeout=5).json()
         except Exception as e:
-            print(f"❌ 无法连接到 Mihomo API: {e}")
+            print(f"❌ 连接到 API 失败: {e}")
             return
         
         proxies_dict = proxies_res.get("proxies", {})
         test_url = "http://www.gstatic.com/generate_204"
-        timeout_ms = 3000  # 超过 3 秒视为死节点
+        timeout_ms = 3000
         
         valid_nodes = []
-        
-        # 建立一个快速查找原始分享链接的映射表
         link_mapping = {}
         if os.path.exists("all_proxies.json"):
             with open("all_proxies.json", "r", encoding="utf-8") as jf:
@@ -101,7 +135,6 @@ def run_speedtest():
             except:
                 print(f"  ❌ [连接异常] {name}")
         
-        # 💾 将真正有效的、测试通畅的节点写入单独的文件
         output_file = "valid_links.txt"
         with open(output_file, "w", encoding="utf-8") as wf:
             wf.write("# 🌐 通过 GitHub Actions 自动化初筛的高可用代理列表\n")
@@ -120,6 +153,11 @@ def run_speedtest():
             process.wait()
         if os.path.exists(config_file):
             os.remove(config_file)
+        # 清理临时工作目录
+        if os.path.exists("mihomo_kernel.log"):
+            try: log_file.close() 
+            except: pass
+            os.remove("mihomo_kernel.log")
 
 if __name__ == "__main__":
     run_speedtest()
