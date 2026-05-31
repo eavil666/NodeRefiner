@@ -42,7 +42,7 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml"):
     with open("all_proxies.json", "r", encoding="utf-8") as jf:
         json_proxies = json.load(jf)
         for idx, p in enumerate(json_proxies):
-            # 1. ✨【核心修复】严格校验代理端口合法性，防止 invalid port 导致内核闪退
+            # 1. 严格校验代理端口合法性，防止 invalid port 导致内核闪退
             try:
                 port_val = int(p.get('port', 0))
                 if port_val <= 0 or port_val > 65535:
@@ -55,7 +55,17 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml"):
             # 过滤掉非内核的原生辅助字段
             clean_proxy = {k: v for k, v in p.items() if k not in ['fingerprint', 'timestamp', 'share_link', 'xray_config', 'source_urls']}
             
-            # 2. 将 alpn 从字符串平滑转换为 Mihomo 要求的 Slice (列表) 格式
+            # 2. ✨【核心修复】针对 WireGuard 协议缺失 local address (ip) 进行安全补全防闪退
+            proxy_type = str(clean_proxy.get('type', '')).lower()
+            if proxy_type in ['wireguard', 'wg']:
+                # Mihomo 内核在解析 WG 时，优先识别 'ip' 字段。如果缺失，自动塞入默认客户端私有 IP 数组
+                if 'ip' not in clean_proxy or not clean_proxy['ip']:
+                    clean_proxy['ip'] = ["10.0.0.2"]
+                elif isinstance(clean_proxy['ip'], str):
+                    # 如果采集到的是字符串格式，切分为列表
+                    clean_proxy['ip'] = [x.strip() for x in clean_proxy['ip'].split(',') if x.strip()]
+
+            # 3. 将 alpn 从字符串平滑转换为 Mihomo 要求的 Slice (列表) 格式
             if 'alpn' in clean_proxy and clean_proxy['alpn']:
                 alpn_val = clean_proxy['alpn']
                 if isinstance(alpn_val, str):
@@ -68,8 +78,13 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml"):
                 else:
                     del clean_proxy['alpn']
             
-            # 3. 兼容性清洗：如果含有空字符串的 alpn、sni 等，直接移除该键，走内核默认缺省值
-            for optional_key in ['alpn', 'sni', 'host', 'path']:
+            # 4. 兼容性清洗：如果含有空字符串的 alpn、sni 等，直接移除该键，走内核默认缺省值
+            # 注意：'ip' 字段如果是空字符串要单独清理，但上面已经对 WireGuard 做了特殊补全防御
+            keys_to_check = ['alpn', 'sni', 'host', 'path']
+            if proxy_type not in ['wireguard', 'wg']:
+                keys_to_check.append('ip') # 非 WG 协议如果含有空的 'ip' 字段，予以剔除
+                
+            for optional_key in keys_to_check:
                 if optional_key in clean_proxy and (clean_proxy[optional_key] == "" or clean_proxy[optional_key] is None):
                     del clean_proxy[optional_key]
 
