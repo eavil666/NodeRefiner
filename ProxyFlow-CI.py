@@ -499,80 +499,58 @@ class YAMLConfigProcessor:
             logger.warning(f"⚠️ [源头熔断] 节点 '{name_val}' 端口解析异常，自动隔离。")
             return False, None
 
-        # 3. ✨【新规防闪退】针对新协议进行鉴权字段强制阻断（防止报 unset fields: username/uuid）
+        # 3. ✨【新规防闪退】混淆(obfs)字段深度清洗防御 (防止报 missing obfs password)
+        if 'obfs' in proxy:
+            obfs_val = proxy['obfs']
+            # 如果 obfs 字段本身是布尔值 True，或者字符串 "shadowsocks", "http" 等，需要检查密码
+            if obfs_val and str(obfs_val).lower() != 'none':
+                # 检查是否存在对应的 obfs-password
+                obfs_pass = proxy.get('obfs-password', proxy.get('obfs_password', ''))
+                # 如果没有独立密码，再检查是否存在于 plugin-opts 中
+                if not obfs_pass and isinstance(proxy.get('plugin-opts'), dict):
+                    obfs_pass = proxy['plugin-opts'].get('password', '')
+                
+                # 如果开启了混淆却找不到任何密码凭证，直接剔除混淆以防内核报错闪退（降级为原生传输测速）
+                if not str(obfs_pass).strip():
+                    logger.warning(f"⚠️ [前置净化] 节点 '{name_val}' 开启了 obfs 却缺失密码，已强制关闭其混淆特性。")
+                    proxy.pop('obfs', None)
+                    proxy.pop('obfs-password', None)
+                    proxy.pop('obfs_password', None)
+
+        # 4. 针对新协议进行鉴权字段强制阻断（防止报 unset fields）
         if ptype in ['tuic', 'anytls']:
-            # tuic / anytls 必须拥有 uuid 或者是传统的 token/password
             uuid_val = str(proxy.get('uuid', '')).strip()
             pass_val = str(proxy.get('password', '')).strip()
             if not uuid_val and not pass_val:
-                logger.warning(f"⚠️ [源头熔断] TUIC/AnyTLS 节点 '{name_val}' 缺失凭证(uuid/password)，直接拦截。")
                 return False, None
-
-        elif ptype in ['hysteria2', 'hy2', 'hysteria', 'trojan']:
-            # Hysteria2 / Hysteria / Trojan 必须拥有密码
+        elif ptype in ['hysteria2', 'hy2', 'trojan']:
             if not str(proxy.get('password', '')).strip():
-                logger.warning(f"⚠️ [源头熔断] {proxy['type']} 节点 '{name_val}' 缺失 password，直接拦截。")
                 return False, None
-
-        elif ptype in ['http', 'socks5']:
-            username_val = str(proxy.get('uuid', proxy.get('username', ''))).strip()
-            password_val = str(proxy.get('password', '')).strip()
-            if (username_val and not password_val) or (password_val and not username_val):
-                logger.warning(f"⚠️ [源头熔断] {proxy['type']} 节点 '{name_val}' auth 信息不完整，username/password 必须配对，直接拦截。")
-                return False, None
-            if username_val:
-                proxy['uuid'] = username_val
-
-        elif ptype in ['ssr', 'shadowsocksr']:
-            # SSR 必须拥有密码与加密方式
-            cipher_val = str(proxy.get('cipher', proxy.get('method', ''))).strip()
-            if not cipher_val or cipher_val.lower() == 'none':
-                logger.warning(f"⚠️ [源头熔断] SSR 节点 '{name_val}' 缺失 cipher/method，直接拦截。")
-                return False, None
-            proxy['cipher'] = cipher_val
-            proxy['protocol'] = str(proxy.get('protocol', proxy.get('proto', 'origin'))).strip() or 'origin'
-            proxy['obfs'] = str(proxy.get('obfs', 'plain')).strip() or 'plain'
-
-        elif ptype == 'mieru':
-            # Mieru 目前当作带密码的专有协议处理
-            if not str(proxy.get('password', '')).strip():
-                logger.warning(f"⚠️ [源头熔断] Mieru 节点 '{name_val}' 缺失 password，直接拦截。")
-                return False, None
-
         elif ptype in ['vless', 'vmess']:
-            # Vless / Vmess 必须拥有 UUID
             if not str(proxy.get('uuid', '')).strip():
-                logger.warning(f"⚠️ [源头熔断] {proxy['type']} 节点 '{name_val}' 缺失 uuid，直接拦截。")
                 return False, None
 
-        # 4. WireGuard (wg) 专属核心字段熔断与格式收敛
+        # 5. WireGuard (wg) 专属核心字段熔断与格式收敛
         if ptype in ['wireguard', 'wg']:
             private_key = str(proxy.get('private-key', proxy.get('private_key', ''))).strip()
             if not private_key or private_key.lower() == "none":
-                logger.warning(f"⚠️ [源头熔断] WG节点 '{name_val}' 缺失核心秘钥 private-key，阻止其进入测速流。")
                 return False, None
             proxy['private-key'] = private_key 
 
             ip_field = proxy.get('ip', '10.0.0.2')
             if isinstance(ip_field, list):
-                if len(ip_field) > 0:
-                    proxy['ip'] = str(ip_field[0]).strip()
-                else:
-                    proxy['ip'] = "10.0.0.2"
+                proxy['ip'] = str(ip_field[0]).strip() if len(ip_field) > 0 else "10.0.0.2"
             else:
                 proxy['ip'] = str(ip_field).strip()
-            
             if not proxy['ip'] or proxy['ip'].lower() == "none":
                 proxy['ip'] = "10.0.0.2"
 
-        # 5. Vmess 专属核心字段 alterId 自动对齐强补全
+        # 6. Vmess 专属核心字段 alterId 自动对齐强补全
         elif ptype == 'vmess':
-            try:
-                proxy['alterId'] = int(proxy.get('alterId', 0))
-            except:
-                proxy['alterId'] = 0
+            try: proxy['alterId'] = int(proxy.get('alterId', 0))
+            except: proxy['alterId'] = 0
 
-        # 6. 跨协议高危传输层字段 alpn 类型擦除与 Slice 级联对齐
+        # 7. 跨协议高危传输层字段 alpn 类型擦除与 Slice 级联对齐
         if 'alpn' in proxy and proxy['alpn']:
             raw_alpn = proxy['alpn']
             processed_alpn = []
@@ -583,13 +561,12 @@ class YAMLConfigProcessor:
                     processed_alpn = [item.strip() for item in raw_alpn.split(',') if item.strip()]
                 else:
                     processed_alpn = [raw_alpn.strip()]
-            
             if processed_alpn:
                 proxy['alpn'] = processed_alpn
             else:
                 if 'alpn' in proxy: del proxy['alpn']
 
-        # 7. 清理可能引起内核类型映射失败的空白字符串
+        # 8. 清理可能引起内核类型映射失败的空白字符串
         for uncompliant_key in ['sni', 'host', 'path']:
             if uncompliant_key in proxy and (proxy[uncompliant_key] == "" or proxy[uncompliant_key] is None):
                 del proxy[uncompliant_key]
