@@ -41,27 +41,34 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml"):
 
     with open("all_proxies.json", "r", encoding="utf-8") as jf:
         json_proxies = json.load(jf)
-        for p in json_proxies:
+        for idx, p in enumerate(json_proxies):
+            # 1. ✨【核心修复】严格校验代理端口合法性，防止 invalid port 导致内核闪退
+            try:
+                port_val = int(p.get('port', 0))
+                if port_val <= 0 or port_val > 65535:
+                    print(f"⚠️ 熔断过滤: 节点 [{idx}] '{p.get('name', 'Unknown')}' 端口为非法值 ({port_val})，已自动剔除。")
+                    continue
+            except (ValueError, TypeError):
+                print(f"⚠️ 熔断过滤: 节点 [{idx}] '{p.get('name', 'Unknown')}' 端口类型异常，已自动剔除。")
+                continue
+
             # 过滤掉非内核的原生辅助字段
             clean_proxy = {k: v for k, v in p.items() if k not in ['fingerprint', 'timestamp', 'share_link', 'xray_config', 'source_urls']}
             
-            # ✨【核心修复】将 alpn 从字符串平滑转换为 Mihomo 要求的 Slice (列表) 格式
+            # 2. 将 alpn 从字符串平滑转换为 Mihomo 要求的 Slice (列表) 格式
             if 'alpn' in clean_proxy and clean_proxy['alpn']:
                 alpn_val = clean_proxy['alpn']
                 if isinstance(alpn_val, str):
-                    # 如果字符串里包含逗号（如 "h2,http/1.1"），拆分成列表；否则单元素独立成列表
                     if ',' in alpn_val:
                         clean_proxy['alpn'] = [item.strip() for item in alpn_val.split(',') if item.strip()]
                     else:
                         clean_proxy['alpn'] = [alpn_val.strip()]
                 elif isinstance(alpn_val, list):
-                    # 已经是列表则保持不变
                     pass
                 else:
-                    # 其它异常类型直接剔除，避免阻塞内核
                     del clean_proxy['alpn']
             
-            # 兼容性清洗：如果含有空字符串的 alpn、sni 等，直接移除该键，走内核默认缺省值
+            # 3. 兼容性清洗：如果含有空字符串的 alpn、sni 等，直接移除该键，走内核默认缺省值
             for optional_key in ['alpn', 'sni', 'host', 'path']:
                 if optional_key in clean_proxy and (clean_proxy[optional_key] == "" or clean_proxy[optional_key] is None):
                     del clean_proxy[optional_key]
@@ -70,7 +77,7 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml"):
 
     # 兜底防御：防止 proxies 数组为空导致内核启动失败
     if not config["proxies"]:
-        print("⚠️ 警告: 转换后的有效 proxies 数组为空，跳过本次测速流程。")
+        print("⚠️ 警告: 过滤后有效 proxies 数组为空，跳过本次测速流程。")
         return False
 
     config["proxy-groups"] = [
@@ -81,7 +88,7 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml"):
     with open(config_path, "w", encoding="utf-8") as wf:
         yaml.dump(config, wf, allow_unicode=True, sort_keys=False)
     
-    print(f"📊 临时配置文件构建成功，共载入 {len(config['proxies'])} 个节点进行筛选。")
+    print(f"📊 临时配置文件构建成功，共载入 {len(config['proxies'])} 个规范化节点进行筛选。")
     return True
 
 def run_speedtest():
@@ -89,23 +96,21 @@ def run_speedtest():
     if not generate_temp_config(config_file):
         return
 
-    # 💡 核心预防：在 Linux 下创建一个虚拟的空工作目录，防止 mihomo 因为找不到/去下载 GeoIP 数据库而闪退
+    # 创建虚拟工作目录绕过 GeoIP 强校验
     os.makedirs("clash_dummy", exist_ok=True)
     with open("clash_dummy/Country.mmdb", "w") as f:
-        f.write("") # 写入空数据骗过内核的初始化检查
+        f.write("") 
 
     print("🚀 正在启动后台 Mihomo 内核进程...")
     process = None
     try:
-        # 💡 升级启动方式：把 stdout/stderr 写入本地临时文件，如果连不上可以打印日志排查
         log_file = open("mihomo_kernel.log", "w")
         process = subprocess.Popen(
-            [MIHOMO_PATH, "-f", config_file, "-d", "./clash_dummy"], # 指定配置与工作目录
+            [MIHOMO_PATH, "-f", config_file, "-d", "./clash_dummy"],
             stdout=log_file,
             stderr=log_file
         )
         
-        # 💡 智能弹性连接：不再死等 3 秒，每隔 1 秒探测一次端口，最多等 15 秒
         print("⏳ 正在等待 Mihomo 外部控制器 (API) 端口开放...")
         api_ready = False
         for i in range(15):
@@ -117,7 +122,6 @@ def run_speedtest():
             
         if not api_ready:
             print("❌ 严重错误: Mihomo 内核在 15 秒内未能成功监听 9090 端口！")
-            # 读取并打印内核的真实崩溃日志
             if os.path.exists("mihomo_kernel.log"):
                 print("\n📋 ─── 以下为 Mihomo 内核崩溃日志 ───")
                 with open("mihomo_kernel.log", "r") as lf:
@@ -181,7 +185,6 @@ def run_speedtest():
             process.wait()
         if os.path.exists(config_file):
             os.remove(config_file)
-        # 清理临时工作目录
         if os.path.exists("mihomo_kernel.log"):
             try: log_file.close() 
             except: pass
