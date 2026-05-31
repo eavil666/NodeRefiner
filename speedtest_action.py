@@ -58,7 +58,7 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml"):
             if not type_val or not server_val:
                 continue
 
-            # 2. 🚀【核心重构】显式创建纯净字典，只保留最核心基础属性，丢弃所有未知杂质
+            # 2. 创建纯净字典，只保留最核心基础属性
             clean_proxy = {
                 "name": name_val,
                 "type": type_val,
@@ -76,7 +76,7 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml"):
                 if transport_field in p and p[transport_field]:
                     clean_proxy[transport_field] = p[transport_field]
 
-            # 5. ✨【终极防御】彻底驯服 alpn 字段，若无法变成标准的 slice/list 则直接剔除
+            # 5. 彻底驯服 alpn 字段，若无法变成标准的 slice/list 则直接剔除
             if 'alpn' in p and p['alpn']:
                 raw_alpn = p['alpn']
                 processed_alpn = []
@@ -89,13 +89,22 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml"):
                     else:
                         processed_alpn = [raw_alpn.strip()]
                 
-                # 只有成功转换为非空列表，才写入配置；否则彻底放弃该字段，防闪退
                 if processed_alpn:
                     clean_proxy['alpn'] = processed_alpn
 
-            # 6. 针对 WireGuard 协议严格清洗 ip 字符串
+            # 6. 协议特异性修补逻辑
             proxy_type_lower = type_val.lower()
-            if proxy_type_lower in ['wireguard', 'wg']:
+            
+            # ✨【新增强制修补】针对 Vmess 协议补全必备的 alterId，防止内核闪退
+            if proxy_type_lower == 'vmess':
+                # 如果没有填写 alterId，或者填写的不是整数，强制补全为现代标准的 0
+                try:
+                    clean_proxy['alterId'] = int(p.get('alterId', 0))
+                except:
+                    clean_proxy['alterId'] = 0
+
+            # 针对 WireGuard 协议严格清洗 ip 字符串
+            elif proxy_type_lower in ['wireguard', 'wg']:
                 raw_ip = p.get('ip', '10.0.0.2')
                 if isinstance(raw_ip, list) and len(raw_ip) > 0:
                     clean_proxy['ip'] = str(raw_ip[0]).strip()
