@@ -37,25 +37,27 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
         
     proxies_to_load = []
     
-    # 支持的标准内核协议白名单
+    # 内核支持的标准协议白名单
     SUPPORTED_TYPES = {
         'ss', 'shadowsocks', 'snell', 'vmess', 'vless', 
         'trojan', 'hysteria', 'hysteria2', 'hy2', 'tuic', 
         'wireguard', 'wg', 'ssr', 'shadowsocksr', 'socks5', 'http'
     }
 
+    # SSR 协议内核允许的合法混淆白名单
+    VALID_SSR_OBFS = {'plain', 'http_simple', 'http_post', 'random_head', 'tls1.2_ticket_auth', 'tls1.2_ticket_fastauth'}
+
     for idx, p in enumerate(json_proxies):
         if not isinstance(p, dict):
             continue
             
-        # 0. 严格阻断无名或残缺幽灵节点
         node_name = str(p.get('name', '')).strip()
         ptype_lower = str(p.get('type', '')).strip().lower()
         
         if not node_name or node_name == "None" or node_name == "":
             continue
             
-        # ✨【核心防御 1】：非白名单标准协议，直接拦截，防止不认识的空协议让内核崩溃
+        # 核心防御 1：非白名单协议直接过滤
         if ptype_lower not in SUPPORTED_TYPES:
             continue
 
@@ -65,11 +67,12 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
             if k not in ['fingerprint', 'timestamp', 'share_link', 'xray_config', 'source_urls', 'source_url']
         }
         
-        # 修复规范化协议名称
+        # 修正规范化协议名称
         clean_proxy['type'] = ptype_lower
         if ptype_lower == 'wg': clean_proxy['type'] = 'wireguard'
         if ptype_lower == 'hy2': clean_proxy['type'] = 'hysteria2'
         if ptype_lower == 'shadowsocks': clean_proxy['type'] = 'ss'
+        if ptype_lower == 'shadowsocksr': clean_proxy['type'] = 'ssr'
 
         # 1. 字段名称平滑映射 (下划线转中划线)
         if 'skip_cert_verify' in clean_proxy:
@@ -83,30 +86,39 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
         if 'obfs_password' in clean_proxy:
             clean_proxy['obfs-password'] = clean_proxy.pop('obfs_password')
 
-        # 2. ✨【核心防御 2】：针对各协议鉴权和传输残缺字段进行毁灭性熔断检查
+        # 2. 协议特异性健壮校验与防闪退熔断
         is_corrupted = False
         
-        # 针对 TUIC 协议的防闪退彻底净化
-        if clean_proxy['type'] == 'tuic':
-            # 获取凭证，tuic 核心必须要有 token/password/uuid 之一
+        # ✨【针对本次报错的致命防护】：强清洗 SSR 协议混淆缺陷
+        if clean_proxy['type'] == 'ssr':
+            ssr_obfs = str(clean_proxy.get('obfs', '')).strip().lower()
+            # 如果混淆为空、为 none 或者不在内核支持的白名单内，直接熔断抛弃该节点，防止 initialize obfs error 闪退
+            if not ssr_obfs or ssr_obfs == 'none' or ssr_obfs not in VALID_SSR_OBFS:
+                is_corrupted = True
+            else:
+                clean_proxy['obfs'] = ssr_obfs
+                
+            # 顺便强校验 ssr 的 protocol 字段
+            if not str(clean_proxy.get('protocol', '')).strip():
+                clean_proxy['protocol'] = 'origin'
+
+        # 针对 TUIC 协议防御
+        elif clean_proxy['type'] == 'tuic':
             uuid_val = str(clean_proxy.get('uuid', clean_proxy.get('password', clean_proxy.get('token', '')))).strip()
             if not uuid_val or uuid_val == "None":
-                is_corrupted = True # 缺凭证，标记损坏
+                is_corrupted = True
             else:
                 clean_proxy['uuid'] = uuid_val
-                # 显式补全 TUIC 所需的核心空缺默认字段，防止报 unset fields
                 if 'port' not in clean_proxy: clean_proxy['port'] = 443
-                
-            # 彻底拔除干扰内核自动推导 transport 的多余残缺字段
             clean_proxy.pop('transport', None)
             clean_proxy.pop('username', None)
 
-        # 针对 Hysteria / Hysteria2 协议的防闪退净化
+        # 针对 Hysteria / Hysteria2 协议防御
         elif clean_proxy['type'] in ['hysteria', 'hysteria2']:
             if not str(clean_proxy.get('password', '')).strip() or clean_proxy.get('password') == "None":
                 is_corrupted = True
 
-        # 针对 Vmess / Vless 协议的防闪退净化
+        # 针对 Vmess / Vless 协议防御
         elif clean_proxy['type'] in ['vmess', 'vless']:
             if not str(clean_proxy.get('uuid', '')).strip() or clean_proxy.get('uuid') == "None":
                 is_corrupted = True
@@ -122,12 +134,12 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
             if not str(clean_proxy.get('private-key', '')).strip():
                 is_corrupted = True
 
-        # 如果节点在上面被检测出关键认证字段不齐，直接丢弃，不载入测速
+        # 如果触发协议层致命损坏，直接阻断，不载入配置
         if is_corrupted:
             continue
 
-        # 3. 混淆(obfs)字段净化
-        if 'obfs' in clean_proxy:
+        # 3. 混淆(obfs)字段净化 (针对标准 SS 协议)
+        if 'obfs' in clean_proxy and clean_proxy['type'] != 'ssr':
             obfs_type = str(clean_proxy['obfs']).strip().lower()
             if obfs_type and obfs_type != 'none':
                 has_password = False
@@ -161,7 +173,7 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
         proxies_to_load.append(clean_proxy)
 
     if not proxies_to_load:
-        print("⚠️ 警告: 经过协议指纹过滤后无任何有效代理节点，跳过本次测速。")
+        print("⚠️ 警告: 过滤后无任何有效代理节点，跳过本次测速。")
         return False
 
     config = {
@@ -186,7 +198,7 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
     with open(config_path, "w", encoding="utf-8") as wf:
         yaml.dump(config, wf, allow_unicode=True, sort_keys=False)
     
-    print(f"📊 测速配置文件组装完毕，共过滤并成功载入 {len(proxies_to_load)} 个绝对合规的代理节点。")
+    print(f"📊 测速配置文件组装完毕，共成功清洗并载入 {len(proxies_to_load)} 个高规范节点。")
     return True
 
 def run_speedtest():
@@ -229,7 +241,7 @@ def run_speedtest():
         try:
             proxies_res = requests.get(f"{API_URL}/proxies", timeout=5).json()
         except Exception as e:
-            print(f"❌ 通信异常，无法连接到本地内核 API: {e}")
+            print(f"❌ 通信异常，无法连接 to 本地内核 API: {e}")
             return
         
         proxies_dict = proxies_res.get("proxies", {})
