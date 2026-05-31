@@ -1,0 +1,65 @@
+name: 🚀 代理节点自动化测速
+
+on:
+  push:
+    branches:
+      - main  # 当你向 main 分支 push 代码时触发
+  schedule:
+    - cron: '0 */6 * * *'  # 🕒 进阶：每 6 小时自动在后台跑一次测试（可选）
+  workflow_dispatch:      # 允许你在 GitHub 网页上点击按钮手动触发
+
+jobs:
+  speedtest:
+    runs-on: ubuntu-latest  # 使用 GitHub 提供的免费 Linux 环境
+
+    steps:
+    - name: 📥 拉取最新代码
+      uses: actions/checkout@v4
+
+    - name: 🐍 初始化 Python 环境
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: 📦 安装 Python 依赖库
+      run: |
+        python -m pip install --upgrade pip
+        pip install requests pyyaml
+
+    - name: ⚙️ 下载并安装 Mihomo (Clash.Meta) 内核
+      run: |
+        # 自动获取并下载适用于 Linux amd64 的最新版本 mihomo
+        curl -L -o mihomo.gz https://github.com/MetaCubeX/mihomo/releases/latest/download/mihomo-linux-amd64-compatible.gz
+        gunzip mihomo.gz
+        chmod +x mihomo
+        # 验证内核是否可用
+        ./mihomo -v
+
+    - name: 🏃 运行前置节点采集 (ProxyFlow-CI.py)
+      run: |
+        # 确保存在 urls.txt，然后运行你的采集脚本生成 all_proxies.json 和 all_links.txt
+        if [ -f "urls.txt" ]; then
+          python ProxyFlow-CI.py
+        else
+          echo "⚠️ 找不到 urls.txt，请确保仓库中包含该文件"
+          exit 1
+        fi
+
+    - name: ⚡ 运行 Mihomo 路由测速脚本
+      run: |
+        # 运行测速脚本（需配合下方修改后的 Python 脚本）
+        python speedtest_action.py
+
+    - name: 💾 将可用节点与测试结果提交回仓库
+      run: |
+        git config --global user.name "GitHub Actions Bot"
+        git config --global user.email "actions@github.com"
+        
+        # 检查是否有文件发生变动
+        git add .
+        if git diff --staged --quiet; then
+          echo "🎉 没有发现新数据变动，无需提交。"
+        else
+          git commit -m "🤖 自动同步: 更新节点有效性测试报告 [skip ci]"
+          git push
+        fi
