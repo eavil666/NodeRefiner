@@ -40,7 +40,6 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
         if not isinstance(p, dict):
             continue
             
-        # 0. 严格阻断无名或残缺幽灵节点
         node_name = str(p.get('name', '')).strip()
         if not node_name or node_name == "None":
             continue
@@ -60,11 +59,29 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
             clean_proxy['public-key'] = clean_proxy.pop('public_key')
         if 'preshared_key' in clean_proxy:
             clean_proxy['preshared-key'] = clean_proxy.pop('preshared_key')
+        if 'obfs_password' in clean_proxy:
+            clean_proxy['obfs-password'] = clean_proxy.pop('obfs_password')
 
-        # 2. 协议特异性强补全与逻辑防御
+        # 2. ✨【针对本次报错的防御】：对混淆(obfs)字段进行终极清洗
+        if 'obfs' in clean_proxy:
+            obfs_type = str(clean_proxy['obfs']).strip().lower()
+            if obfs_type and obfs_type != 'none':
+                # 检查是否存在密码
+                has_password = False
+                if 'obfs-password' in clean_proxy and str(clean_proxy['obfs-password']).strip():
+                    has_password = True
+                elif isinstance(clean_proxy.get('plugin-opts'), dict) and str(clean_proxy['plugin-opts'].get('password', '')).strip():
+                    has_password = True
+                
+                # 如果开启了混淆但没有密码，强行剔除 obfs 键值对，保护内核不闪退
+                if not has_password:
+                    clean_proxy.pop('obfs', None)
+                    clean_proxy.pop('obfs-password', None)
+
+        # 3. 协议特异性强补全与逻辑防御
         ptype_lower = str(clean_proxy.get('type', '')).lower()
         
-        # 针对 WireGuard 补全本地地址 (ip 字段)
+        # 针对 WireGuard 补全本地地址
         if ptype_lower in ['wireguard', 'wg']:
             if 'ip' not in clean_proxy or not str(clean_proxy['ip']).strip() or clean_proxy['ip'] == "None":
                 if 'host' in clean_proxy and str(clean_proxy['host']).strip() and clean_proxy['host'] != "None":
@@ -73,15 +90,13 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
                     clean_proxy['ip'] = "10.0.0.2"
             clean_proxy.pop('host', None)
 
-        # ✨【针对本次报错的防御】：补全 TUIC 协议可能触发的凭证或传输层解析缺陷
+        # 针对 TUIC 协议的鉴权映射
         elif ptype_lower == 'tuic':
-            # Mihomo 的 tuic 核心字段包含：uuid/password (二选一)
             if 'uuid' not in clean_proxy and 'password' in clean_proxy:
-                clean_proxy['uuid'] = clean_proxy['password'] # 相互对齐做兼容
-            # 如果配置里带有一些多余的不规范字段干扰了内核对 transport 的自动推导，给予移除
+                clean_proxy['uuid'] = clean_proxy['password']
             clean_proxy.pop('transport', None)
 
-        # 3. 彻底驯服 alpn 属性
+        # 4. 彻底驯服 alpn 属性
         if 'alpn' in clean_proxy and clean_proxy['alpn']:
             raw_alpn = clean_proxy['alpn']
             final_alpn = []
@@ -107,7 +122,6 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
         print("⚠️ 警告: 过滤后无有效代理节点，跳过本次测速。")
         return False
 
-    # 组装完整的 Clash/Mihomo 基础配置字典
     config = {
         "port": 7890,
         "socks-port": 7891,
