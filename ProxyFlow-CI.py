@@ -491,7 +491,7 @@ class YAMLConfigProcessor:
         return True, proxy
     
     def extract_all_proxies(self, config_content: str, source_url: str) -> List[ProxyInfo]:
-        """从拉取的 YAML 配置中精准提取代理项（已集成前置强校验机制）"""
+        """从拉取的 YAML 配置中精准提取代理项（已集成前置强校验机制与 WireGuard 本地 IP 固化）"""
         all_proxies = []
         try:
             config_data = None
@@ -510,7 +510,7 @@ class YAMLConfigProcessor:
             
             for idx, proxy in enumerate(proxies):
                 try:
-                    # ✨ [调用前置过滤器] 在这里拦截、清洗与熔断
+                    # [调用前置过滤器] 在这里拦截、清洗与熔断
                     is_pass, cleaned_proxy = self.validate_and_clean_proxy_dict(proxy, idx, source_url)
                     if not is_pass or not cleaned_proxy:
                         continue # 被安全隔离熔断，直接跳过处理下一个节点
@@ -519,7 +519,7 @@ class YAMLConfigProcessor:
                     server_addr = cleaned_proxy['server']
                     
                     # 局域网虚拟客户端 IP / Reserved 数据集数组处理
-                    ip_field = cleaned_proxy.get('ip', '')
+                    ip_field = cleaned_proxy.get('ip', '10.0.0.2')
                     if isinstance(ip_field, list): ip_field = ",".join(ip_field)
                     reserved_field = cleaned_proxy.get('reserved', '')
                     if isinstance(reserved_field, list): reserved_field = ",".join(map(str, reserved_field))
@@ -537,11 +537,12 @@ class YAMLConfigProcessor:
                         udp=bool(cleaned_proxy.get('udp', True)),
                         alterId=int(cleaned_proxy.get('alterId', 0)),
                         sni=str(cleaned_proxy.get('sni', '')),
-                        host=ip_field if ptype in ['wireguard', 'wg'] else str(cleaned_proxy.get('host', '')),
+                        # ✨【关键修复】让 host 存放清洗好的本地 IP，并保证 cleaned_proxy 的原生属性也留存
+                        host=str(ip_field), 
                         path=str(cleaned_proxy.get('path', '')),
                         security=str(cleaned_proxy.get('security', '')),
                         scy=str(cleaned_proxy.get('scy', '')),
-                        alpn=cleaned_proxy.get('alpn', ''), # 已在上面规范化为列表或彻底清除
+                        alpn=cleaned_proxy.get('alpn', ''), 
                         skip_cert_verify=bool(cleaned_proxy.get('skip-cert-verify', False)),
                         source_url=source_url,
                         private_key=str(cleaned_proxy.get('private-key', '')),
@@ -550,6 +551,10 @@ class YAMLConfigProcessor:
                         reserved=str(reserved_field),
                         mtu=int(cleaned_proxy.get('mtu', 1420))
                     )
+                    
+                    # ✨ 动态追加一个 ip 属性到对象，确保 to_dict() 时能顺理成章进入 JSON 字典
+                    proxy_info.ip = str(ip_field)
+                    
                     all_proxies.append(proxy_info)
                 except Exception as e:
                     logger.error(f"构造代理实体发生细节异常: {e}, 略过损坏节点数据项")

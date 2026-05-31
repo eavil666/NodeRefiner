@@ -56,28 +56,41 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
         if 'preshared_key' in clean_proxy:
             clean_proxy['preshared-key'] = clean_proxy.pop('preshared_key')
 
-        # 2. ✨【最高优先级防御】彻底驯服 alpn 属性
+        # 2. 协议特异性强补全与逻辑防御
+        ptype_lower = str(clean_proxy.get('type', '')).lower()
+        
+        # ✨【针对本次报错的终极防护】：强制给 WireGuard 补全本地地址 (ip 字段)
+        if ptype_lower in ['wireguard', 'wg']:
+            # 如果没有 'ip' 或者 'ip' 是空的
+            if 'ip' not in clean_proxy or not str(clean_proxy['ip']).strip() or clean_proxy['ip'] == "None":
+                # 尝试拿 host 字段作为兜底
+                if 'host' in clean_proxy and str(clean_proxy['host']).strip() and clean_proxy['host'] != "None":
+                    clean_proxy['ip'] = clean_proxy['host']
+                else:
+                    # 终极无赖兜底，给一个标准的 WG 本地内网 IP
+                    clean_proxy['ip'] = "10.0.0.2"
+            
+            # 同时：Mihomo 解析 WireGuard 时如果带有不认识的 'host' 或是空 'host' 会报语法隐患，在这里顺手移除
+            clean_proxy.pop('host', None)
+
+        # 3. 彻底驯服 alpn 属性
         if 'alpn' in clean_proxy and clean_proxy['alpn']:
             raw_alpn = clean_proxy['alpn']
             final_alpn = []
             
-            # 判断当前 JSON 里提取出来的实际类型
             if isinstance(raw_alpn, list):
                 final_alpn = [str(x).strip() for x in raw_alpn if x]
             elif isinstance(raw_alpn, str):
-                # 兼容处理残留的字符串
                 if ',' in raw_alpn:
                     final_alpn = [x.strip() for x in raw_alpn.split(',') if x.strip()]
                 else:
                     final_alpn = [raw_alpn.strip()]
             
-            # 只有切片列表非空时才保留，否则直接从配置字典中彻底删除该字段
             if final_alpn:
                 clean_proxy['alpn'] = final_alpn
             else:
                 clean_proxy.pop('alpn', None)
         else:
-            # 如果值为 None, "", 或是空列表，直接移除键，防内核解析器类型硬断言失败
             clean_proxy.pop('alpn', None)
 
         proxies_to_load.append(clean_proxy)
