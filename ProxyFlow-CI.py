@@ -44,6 +44,12 @@ class ProxyInfo:
     host: str = ""
     path: str = ""
     security: str = ""
+    protocol: str = ""
+    obfs: str = ""
+    obfs_host: str = ""
+    obfs_path: str = ""
+    remarks: str = ""
+    group: str = ""
     scy: str = ""
     alpn: Any = ""
     skip_cert_verify: bool = False
@@ -64,13 +70,21 @@ class ProxyInfo:
             data = f"wireguard|{self.server}|{self.port}|{key_part}"
         elif ptype in ['vmess', 'vless']:
             data = f"{self.type}|{self.server}|{self.port}|{self.uuid}"
-        elif ptype in ['hysteria2', 'hy2', 'trojan', 'socks5', 'http']:
+        elif ptype in ['hysteria2', 'hy2']:
+            data = f"hysteria2|{self.server}|{self.port}|{self.password}"
+        elif ptype == 'hysteria':
+            data = f"hysteria|{self.server}|{self.port}|{self.password}"
+        elif ptype in ['trojan', 'socks5', 'http']:
             data = f"{ptype}|{self.server}|{self.port}|{self.password}"
         elif ptype in ['tuic', 'anytls']:
             auth = self.uuid or self.password
             data = f"{ptype}|{self.server}|{self.port}|{auth}"
+        elif ptype in ['ssr', 'shadowsocksr']:
+            data = f"{self.type}|{self.server}|{self.port}|{self.cipher}|{self.password}|{self.protocol}|{self.obfs}|{self.obfs_host}|{self.obfs_path}"
         elif ptype == 'ss':
             data = f"{self.type}|{self.server}|{self.port}|{self.password}|{self.cipher}"
+        elif ptype == 'mieru':
+            data = f"{ptype}|{self.server}|{self.port}|{self.password}|{self.cipher}"
         else:
             data = f"{self.type}|{self.server}|{self.port}|{self.uuid}|{self.password}"
         
@@ -83,11 +97,46 @@ class ProxyInfo:
         
         if ptype in ['hysteria2', 'hy2']:
             params = {}
-            if self.host: params['obfs'] = self.host  
+            if self.obfs_host: params['obfs'] = self.obfs_host
             if self.sni: params['sni'] = self.sni
             query = '&'.join([f"{k}={quote(str(v))}" for k, v in params.items() if v])
             return f"hysteria2://{self.password}@{self.server}:{self.port}" + (f"?{query}" if query else "") + f"#{name_encoded}"
-            
+        elif ptype == 'hysteria':
+            params = {}
+            if self.obfs_host: params['obfs'] = self.obfs_host
+            if self.sni: params['sni'] = self.sni
+            query = '&'.join([f"{k}={quote(str(v))}" for k, v in params.items() if v])
+            return f"hysteria://{self.password}@{self.server}:{self.port}" + (f"?{query}" if query else "") + f"#{name_encoded}"
+        elif ptype == 'ssr' or ptype == 'shadowsocksr':
+            method = self.cipher or 'aes-128-cfb'
+            proto = self.protocol or 'origin'
+            obfs = self.obfs or 'plain'
+            password_b64 = base64.b64encode(self.password.encode('utf-8')).decode('utf-8').rstrip('=')
+            auth = f"{self.server}:{self.port}:{proto}:{method}:{obfs}:{password_b64}"
+            params = {}
+            if self.obfs_host:
+                params['obfsparam'] = base64.b64encode(self.obfs_host.encode('utf-8')).decode('utf-8').rstrip('=')
+            if self.obfs_path:
+                params['protoparam'] = base64.b64encode(self.obfs_path.encode('utf-8')).decode('utf-8').rstrip('=')
+            if self.remarks:
+                params['remarks'] = base64.b64encode(self.remarks.encode('utf-8')).decode('utf-8').rstrip('=')
+            else:
+                params['remarks'] = base64.b64encode(self.name.encode('utf-8')).decode('utf-8').rstrip('=')
+            if self.group:
+                params['group'] = base64.b64encode(self.group.encode('utf-8')).decode('utf-8').rstrip('=')
+            query = '&'.join([f"{k}={quote(str(v))}" for k, v in params.items() if v])
+            encoded = base64.b64encode(auth.encode('utf-8')).decode('utf-8').rstrip('=')
+            return f"ssr://{encoded}/?{query}"
+
+        elif ptype == 'mieru':
+            params = {}
+            if self.sni: params['sni'] = self.sni
+            if self.network: params['network'] = self.network
+            if self.path: params['path'] = self.path
+            if self.obfs_host: params['host'] = self.obfs_host
+            query = '&'.join([f"{k}={quote(str(v))}" for k, v in params.items() if v])
+            return f"mieru://{quote(self.password)}@{self.server}:{self.port}" + (f"?{query}" if query else "") + f"#{name_encoded}"
+
         elif ptype == 'tuic':
             params = {
                 'alpn': self.alpn or 'h3',
@@ -155,7 +204,7 @@ class ProxyInfo:
             return f"ss://{auth_b64}@{self.server}:{self.port}#{name_encoded}"
             
         elif ptype in ['socks5', 'http']:
-            auth = f"{self.uuid}:{self.password}@" if (self.uuid or self.password) else ""
+            auth = f"{self.uuid}:{self.password}@" if (self.uuid and self.password) else ""
             return f"{ptype}://{auth}{self.server}:{self.port}#{name_encoded}"
             
         return f"unknown://{self.server}:{self.port}#{name_encoded}"
@@ -194,6 +243,17 @@ class ProxyInfo:
         elif ptype in ['hysteria2', 'hy2']:
             return {
                 "protocol": "hysteria2",
+                "settings": {
+                    "servers": [{
+                        "address": self.server,
+                        "port": self.port,
+                        "password": self.password
+                    }]
+                }
+            }
+        elif ptype == 'hysteria':
+            return {
+                "protocol": "hysteria",
                 "settings": {
                     "servers": [{
                         "address": self.server,
@@ -308,7 +368,11 @@ class YAMLConfigProcessor:
         yaml_indicators = ['proxies:', 'mixed-port:', 'port:', 'mode:', 'rules:']
         if any(indicator in content for indicator in yaml_indicators): return True
         
-        proxy_indicators = ['type: vmess', 'type: vless', 'type: ss', 'type: trojan', 'type: wireguard', 'type: wg', 'type: hysteria2', 'type: hy2', 'type: tuic', 'type: anytls']
+        proxy_indicators = [
+            'type: vmess', 'type: vless', 'type: ss', 'type: ssr', 'type: shadowsocksr', 'type: trojan',
+            'type: wireguard', 'type: wg', 'type: hysteria2', 'type: hy2', 'type: hysteria',
+            'type: mieru', 'type: tuic', 'type: anytls'
+        ]
         return any(indicator in content.lower() for indicator in proxy_indicators)
     
     def get_config_from_url(self, url: str) -> Optional[str]:
@@ -444,10 +508,35 @@ class YAMLConfigProcessor:
                 logger.warning(f"⚠️ [源头熔断] TUIC/AnyTLS 节点 '{name_val}' 缺失凭证(uuid/password)，直接拦截。")
                 return False, None
 
-        elif ptype in ['hysteria2', 'hy2', 'trojan']:
-            # Hysteria2 / Trojan 必须拥有密码
+        elif ptype in ['hysteria2', 'hy2', 'hysteria', 'trojan']:
+            # Hysteria2 / Hysteria / Trojan 必须拥有密码
             if not str(proxy.get('password', '')).strip():
-                logger.warning(f"⚠️ [源头熔断] Hysteria2/Trojan 节点 '{name_val}' 缺失 password，直接拦截。")
+                logger.warning(f"⚠️ [源头熔断] {proxy['type']} 节点 '{name_val}' 缺失 password，直接拦截。")
+                return False, None
+
+        elif ptype in ['http', 'socks5']:
+            username_val = str(proxy.get('uuid', proxy.get('username', ''))).strip()
+            password_val = str(proxy.get('password', '')).strip()
+            if (username_val and not password_val) or (password_val and not username_val):
+                logger.warning(f"⚠️ [源头熔断] {proxy['type']} 节点 '{name_val}' auth 信息不完整，username/password 必须配对，直接拦截。")
+                return False, None
+            if username_val:
+                proxy['uuid'] = username_val
+
+        elif ptype in ['ssr', 'shadowsocksr']:
+            # SSR 必须拥有密码与加密方式
+            cipher_val = str(proxy.get('cipher', proxy.get('method', ''))).strip()
+            if not cipher_val or cipher_val.lower() == 'none':
+                logger.warning(f"⚠️ [源头熔断] SSR 节点 '{name_val}' 缺失 cipher/method，直接拦截。")
+                return False, None
+            proxy['cipher'] = cipher_val
+            proxy['protocol'] = str(proxy.get('protocol', proxy.get('proto', 'origin'))).strip() or 'origin'
+            proxy['obfs'] = str(proxy.get('obfs', 'plain')).strip() or 'plain'
+
+        elif ptype == 'mieru':
+            # Mieru 目前当作带密码的专有协议处理
+            if not str(proxy.get('password', '')).strip():
+                logger.warning(f"⚠️ [源头熔断] Mieru 节点 '{name_val}' 缺失 password，直接拦截。")
                 return False, None
 
         elif ptype in ['vless', 'vmess']:
@@ -558,6 +647,12 @@ class YAMLConfigProcessor:
                         host=str(ip_field), 
                         path=str(cleaned_proxy.get('path', '')),
                         security=str(cleaned_proxy.get('security', '')),
+                        protocol=str(cleaned_proxy.get('protocol', '')),
+                        obfs=str(cleaned_proxy.get('obfs', '')),
+                        obfs_host=str(cleaned_proxy.get('obfs-host', cleaned_proxy.get('obfs_host', cleaned_proxy.get('host', '')))),
+                        obfs_path=str(cleaned_proxy.get('obfs-path', cleaned_proxy.get('obfs_path', ''))),
+                        remarks=str(cleaned_proxy.get('remarks', '')),
+                        group=str(cleaned_proxy.get('group', '')),
                         scy=str(cleaned_proxy.get('scy', '')),
                         alpn=cleaned_proxy.get('alpn', ''), 
                         skip_cert_verify=bool(cleaned_proxy.get('skip-cert-verify', False)),
