@@ -45,7 +45,7 @@ class ProxyInfo:
     path: str = ""
     security: str = ""
     scy: str = ""
-    alpn: str = ""
+    alpn: Any = ""
     skip_cert_verify: bool = False
     source_url: str = ""
     
