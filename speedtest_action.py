@@ -41,62 +41,73 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml"):
 
     with open("all_proxies.json", "r", encoding="utf-8") as jf:
         json_proxies = json.load(jf)
+        
         for idx, p in enumerate(json_proxies):
-            # 1. 严格校验代理端口合法性，防止 invalid port 导致内核闪退
+            # 1. 严格校验并提取基本字段
             try:
                 port_val = int(p.get('port', 0))
                 if port_val <= 0 or port_val > 65535:
-                    print(f"⚠️ 熔断过滤: 节点 [{idx}] '{p.get('name', 'Unknown')}' 端口为非法值 ({port_val})，已自动剔除。")
                     continue
-            except (ValueError, TypeError):
-                print(f"⚠️ 熔断过滤: 节点 [{idx}] '{p.get('name', 'Unknown')}' 端口类型异常，已自动剔除。")
+            except:
                 continue
 
-            # 过滤掉非内核的原生辅助字段
-            clean_proxy = {k: v for k, v in p.items() if k not in ['fingerprint', 'timestamp', 'share_link', 'xray_config', 'source_urls']}
-            
-            # 2. ✨【核心修复】针对 WireGuard 协议严格规范 'ip' 字段为字符串（String）格式
-            proxy_type = str(clean_proxy.get('type', '')).lower()
-            if proxy_type in ['wireguard', 'wg']:
-                if 'ip' not in clean_proxy or not clean_proxy['ip']:
-                    clean_proxy['ip'] = "10.0.0.2"
-                elif isinstance(clean_proxy['ip'], list):
-                    # 如果原数据误传了列表，取第一个元素并转为字符串
-                    if len(clean_proxy['ip']) > 0:
-                        clean_proxy['ip'] = str(clean_proxy['ip'][0])
-                    else:
-                        clean_proxy['ip'] = "10.0.0.2"
-                else:
-                    # 确保是纯文本字符串
-                    clean_proxy['ip'] = str(clean_proxy['ip']).strip()
+            name_val = str(p.get('name', f'Node-{idx}')).strip()
+            type_val = str(p.get('type', '')).strip()
+            server_val = str(p.get('server', '')).strip()
 
-            # 3. 将 alpn 从字符串平滑转换为 Mihomo 要求的 Slice (列表) 格式
-            if 'alpn' in clean_proxy and clean_proxy['alpn']:
-                alpn_val = clean_proxy['alpn']
-                if isinstance(alpn_val, str):
-                    if ',' in alpn_val:
-                        clean_proxy['alpn'] = [item.strip() for item in alpn_val.split(',') if item.strip()]
-                    else:
-                        clean_proxy['alpn'] = [alpn_val.strip()]
-                elif isinstance(alpn_val, list):
-                    pass
-                else:
-                    del clean_proxy['alpn']
-            
-            # 4. 兼容性清洗：如果含有空字符串的 alpn、sni 等，直接移除该键，走内核默认缺省值
-            keys_to_check = ['alpn', 'sni', 'host', 'path']
-            if proxy_type not in ['wireguard', 'wg']:
-                keys_to_check.append('ip') # 非 WG 协议如果含有空的 'ip' 字段，予以剔除
+            if not type_val or not server_val:
+                continue
+
+            # 2. 🚀【核心重构】显式创建纯净字典，只保留最核心基础属性，丢弃所有未知杂质
+            clean_proxy = {
+                "name": name_val,
+                "type": type_val,
+                "server": server_val,
+                "port": port_val
+            }
+
+            # 3. 复制其他可能存在的合法可选通用字段
+            for optional_field in ['uuid', 'password', 'cipher', 'udp', 'tls', 'sni', 'skip-cert-verify', 'network', 'public-key', 'short-id']:
+                if optional_field in p and p[optional_field] is not None and p[optional_field] != "":
+                    clean_proxy[optional_field] = p[optional_field]
+
+            # 4. 针对特定协议（如 Shadowsocks/Vmess/Vless）传输层特殊配置的复制
+            for transport_field in ['ws-opts', 'grpc-opts', 'h2-opts', 'http-opts', 'smux']:
+                if transport_field in p and p[transport_field]:
+                    clean_proxy[transport_field] = p[transport_field]
+
+            # 5. ✨【终极防御】彻底驯服 alpn 字段，若无法变成标准的 slice/list 则直接剔除
+            if 'alpn' in p and p['alpn']:
+                raw_alpn = p['alpn']
+                processed_alpn = []
                 
-            for optional_key in keys_to_check:
-                if optional_key in clean_proxy and (clean_proxy[optional_key] == "" or clean_proxy[optional_key] is None):
-                    del optional_key
+                if isinstance(raw_alpn, list):
+                    processed_alpn = [str(item).strip() for item in raw_alpn if item]
+                elif isinstance(raw_alpn, str):
+                    if ',' in raw_alpn:
+                        processed_alpn = [item.strip() for item in raw_alpn.split(',') if item.strip()]
+                    else:
+                        processed_alpn = [raw_alpn.strip()]
+                
+                # 只有成功转换为非空列表，才写入配置；否则彻底放弃该字段，防闪退
+                if processed_alpn:
+                    clean_proxy['alpn'] = processed_alpn
+
+            # 6. 针对 WireGuard 协议严格清洗 ip 字符串
+            proxy_type_lower = type_val.lower()
+            if proxy_type_lower in ['wireguard', 'wg']:
+                raw_ip = p.get('ip', '10.0.0.2')
+                if isinstance(raw_ip, list) and len(raw_ip) > 0:
+                    clean_proxy['ip'] = str(raw_ip[0]).strip()
+                else:
+                    clean_proxy['ip'] = str(raw_ip).strip()
+                if not clean_proxy['ip'] or clean_proxy['ip'] == "None":
+                    clean_proxy['ip'] = "10.0.0.2"
 
             config["proxies"].append(clean_proxy)
 
-    # 兜底防御：防止 proxies 数组为空导致内核启动失败
     if not config["proxies"]:
-        print("⚠️ 警告: 过滤后有效 proxies 数组为空，跳过本次测速流程。")
+        print("⚠️ 警告: 没有任何节点通过纯净规范过滤，跳过本次测速流程。")
         return False
 
     config["proxy-groups"] = [
@@ -107,7 +118,7 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml"):
     with open(config_path, "w", encoding="utf-8") as wf:
         yaml.dump(config, wf, allow_unicode=True, sort_keys=False)
     
-    print(f"📊 临时配置文件构建成功，共载入 {len(config['proxies'])} 个规范化节点进行筛选。")
+    print(f"📊 纯净配置文件构建成功，共载入 {len(config['proxies'])} 个绝对安全的节点。")
     return True
 
 def run_speedtest():
@@ -115,7 +126,6 @@ def run_speedtest():
     if not generate_temp_config(config_file):
         return
 
-    # 创建虚拟工作目录绕过 GeoIP 强校验
     os.makedirs("clash_dummy", exist_ok=True)
     with open("clash_dummy/Country.mmdb", "w") as f:
         f.write("") 
