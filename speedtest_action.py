@@ -12,7 +12,7 @@ CONTROLLER_PORT = 9090
 API_URL = f"http://127.0.0.1:{CONTROLLER_PORT}"
 
 def is_port_open(port: int, host: str = "127.0.0.1") -> bool:
-    """用原生 Socket 检查指定端口是否已经开放监听，不依赖第三方库"""
+    """用原生 Socket 检查指定端口是否已经开放监听"""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(1)
     try:
@@ -23,23 +23,30 @@ def is_port_open(port: int, host: str = "127.0.0.1") -> bool:
         return False
 
 def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
-    """直接读取纯净的 all_proxies.json，组装成临时 Mihomo 配置文件"""
+    """读取 all_proxies.json 并生成用于测速的临时 YAML 配置文件"""
     if not os.path.exists("all_proxies.json"):
         print("❌ 错误: 找不到全局纯净去重库 all_proxies.json，请确保前置抓取步骤已成功。")
         return False
 
     with open("all_proxies.json", "r", encoding="utf-8") as jf:
-        json_proxies = json.load(jf)
+        try:
+            json_proxies = json.load(jf)
+        except Exception as e:
+            print(f"❌ 错误: 解析 all_proxies.json 失败: {e}")
+            return False
         
     proxies_to_load = []
-    for p in json_proxies:
-        # 移除仅用于前置流程或通知的辅助字段，避免干扰 Mihomo 静态解析
+    for idx, p in enumerate(json_proxies):
+        if not isinstance(p, dict):
+            continue
+            
+        # 提取纯净的核心代理属性
         clean_proxy = {
             k: v for k, v in p.items() 
             if k not in ['fingerprint', 'timestamp', 'share_link', 'xray_config', 'source_urls', 'source_url']
         }
         
-        # 针对 Clash/Mihomo 的特殊通用布尔或中划线字段做一层键名平滑映射
+        # 1. 字段名称平滑映射 (下划线转中划线)
         if 'skip_cert_verify' in clean_proxy:
             clean_proxy['skip-cert-verify'] = clean_proxy.pop('skip_cert_verify')
         if 'private_key' in clean_proxy:
@@ -49,13 +56,37 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
         if 'preshared_key' in clean_proxy:
             clean_proxy['preshared-key'] = clean_proxy.pop('preshared_key')
 
+        # 2. ✨【最高优先级防御】彻底驯服 alpn 属性
+        if 'alpn' in clean_proxy and clean_proxy['alpn']:
+            raw_alpn = clean_proxy['alpn']
+            final_alpn = []
+            
+            # 判断当前 JSON 里提取出来的实际类型
+            if isinstance(raw_alpn, list):
+                final_alpn = [str(x).strip() for x in raw_alpn if x]
+            elif isinstance(raw_alpn, str):
+                # 兼容处理残留的字符串
+                if ',' in raw_alpn:
+                    final_alpn = [x.strip() for x in raw_alpn.split(',') if x.strip()]
+                else:
+                    final_alpn = [raw_alpn.strip()]
+            
+            # 只有切片列表非空时才保留，否则直接从配置字典中彻底删除该字段
+            if final_alpn:
+                clean_proxy['alpn'] = final_alpn
+            else:
+                clean_proxy.pop('alpn', None)
+        else:
+            # 如果值为 None, "", 或是空列表，直接移除键，防内核解析器类型硬断言失败
+            clean_proxy.pop('alpn', None)
+
         proxies_to_load.append(clean_proxy)
 
     if not proxies_to_load:
-        print("⚠️ 警告: all_proxies.json 中没有任何可用代理项，跳过本次测速。")
+        print("⚠️ 警告: 过滤后无有效代理节点，跳过本次测速。")
         return False
 
-    # 组装纯净核心配置外壳
+    # 组装完整的 Clash/Mihomo 基础配置字典
     config = {
         "port": 7890,
         "socks-port": 7891,
@@ -78,7 +109,7 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
     with open(config_path, "w", encoding="utf-8") as wf:
         yaml.dump(config, wf, allow_unicode=True, sort_keys=False)
     
-    print(f"📊 测速配置文件构建成功，共无损载入 {len(proxies_to_load)} 个经前置清洗的高规节点。")
+    print(f"📊 测速配置文件组装完毕，共载入 {len(proxies_to_load)} 个绝对合规的代理节点。")
     return True
 
 def run_speedtest():
@@ -86,12 +117,11 @@ def run_speedtest():
     if not generate_temp_config(config_file):
         return
 
-    # 1. 自动生成虚拟工作目录与占位符文件，完美绕过内核强校验
     os.makedirs("clash_dummy", exist_ok=True)
     with open("clash_dummy/Country.mmdb", "w") as f:
         f.write("") 
 
-    print("🚀 正在异步拉起后台 Mihomo 内核进程...")
+    print("🚀 正在拉起后台 Mihomo 内核进程...")
     process = None
     try:
         log_file = open("mihomo_kernel.log", "w")
@@ -101,7 +131,6 @@ def run_speedtest():
             stderr=log_file
         )
         
-        # 2. 控制器监听状态弹性探测
         print("⏳ 正在等待 Mihomo 外部控制器 (API) 端口开放...")
         api_ready = False
         for i in range(15):
@@ -112,15 +141,14 @@ def run_speedtest():
             time.sleep(1)
             
         if not api_ready:
-            print("❌ 严重错误: Mihomo 内核在 15 秒内启动异常，未成功监听 9090 端口！")
+            print("❌ 严重错误: Mihomo 内核在 15 秒内未能成功监听 9090 端口！")
             if os.path.exists("mihomo_kernel.log"):
                 print("\n📋 ─── 以下为 Mihomo 内核崩溃追踪日志 ───")
                 with open("mihomo_kernel.log", "r") as lf:
                     print(lf.read())
             return
         
-        # 3. 通过内置外部控制 API 发起并行延迟测速
-        print("⚡ 正在向内核下发批量并发测试指令 (并发模型由 Go 内核底层驱动)...")
+        print("⚡ 正在下发并行测速指令...")
         try:
             proxies_res = requests.get(f"{API_URL}/proxies", timeout=5).json()
         except Exception as e:
@@ -136,11 +164,10 @@ def run_speedtest():
         if os.path.exists("all_proxies.json"):
             with open("all_proxies.json", "r", encoding="utf-8") as jf:
                 for item in json.load(jf):
-                    link_mapping[item['name']] = item.get('share_link', '')
+                    if isinstance(item, dict) and 'name' in item:
+                        link_mapping[item['name']] = item.get('share_link', '')
 
-        # 遍历测速
         for name, info in proxies_dict.items():
-            # 过滤策略组以及内置无意义节点
             if info.get("type") in ["Selector", "URLTest", "Fallback", "LoadBalance", "Direct", "Reject"]:
                 continue
                 
@@ -161,7 +188,6 @@ def run_speedtest():
             except:
                 print(f"  ❌ [物理连接异常] {name}")
         
-        # 4. 将筛选结果生成高价值产物并持久化
         output_file = "valid_links.txt"
         with open(output_file, "w", encoding="utf-8") as wf:
             wf.write("# 🌐 通过 GitHub Actions 自动化初筛的高可用代理列表\n")
@@ -174,7 +200,6 @@ def run_speedtest():
     except Exception as e:
         print(f"💥 运行期间发生未预期的脚本错误: {e}")
     finally:
-        # 5. 优雅回收资源，确保不留下孤儿后台进程
         if process:
             print("🧹 正在清理，主动终结后台内核进程...")
             process.terminate()
