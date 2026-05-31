@@ -1,0 +1,92 @@
+name: 🚀 代理节点自动化测速
+
+on:
+  push:
+    branches:
+      - main  # 当你向 main 分支 push 代码时触发
+  schedule:
+    - cron: '0 */6 * * *'  # 🕒 进阶：每 6 小时自动在后台跑一次测试（可选）
+  workflow_dispatch:      # 允许你在 GitHub 网页上点击按钮手动触发
+
+jobs:
+  speedtest:
+    runs-on: ubuntu-latest  # 使用 GitHub 提供的免费 Linux 环境
+
+    steps:
+    - name: 📥 拉取最新代码
+      uses: actions/checkout@v4
+
+    - name: 🐍 初始化 Python 环境
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: 📦 安装 Python 依赖库
+      run: |
+        python -m pip install --upgrade pip
+        pip install requests pyyaml
+
+    - name: ⚙️ 下载并安装 Mihomo (Clash.Meta) 内核
+      run: |
+        # 1. 请求 GitHub API 获取最新的 release 数据，并提取出包含 'mihomo-linux-amd64' 且以 '.gz' 结尾的真实下载 URL
+        DOWNLOAD_URL=$(curl -s https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | \
+          jq -r '.assets[] | select(.name | test("mihomo-linux-amd64.*\\.gz$")) | .browser_download_url' | head -n 1)
+        
+        # 打印提取到的链接，方便在日志中对齐检查
+        echo "🌐 探测到最新内核下载链接: $DOWNLOAD_URL"
+        
+        # 2. 如果 API 限制或提取失败，使用兜底的标准 Latest 直链
+        if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" = "null" ]; then
+          echo "⚠️ API 提取失败，正在启动官方 Latest 直链同步机制..."
+          DOWNLOAD_URL="https://github.com/MetaCubeX/mihomo/releases/latest/download/mihomo-linux-amd64.gz"
+        fi
+
+        # 3. 执行高稳定下载
+        curl -L -o mihomo.gz "$DOWNLOAD_URL"
+
+        # 4. 检查下载回来的文件类型（确保不是 404 网页）
+        FILE_TYPE=$(file -b mihomo.gz)
+        echo "📦 下载文件的实际类型为: $FILE_TYPE"
+
+        # 5. 解压并赋予执行权限
+        # 如果下载下来的是真正的 gzip，用 gzip 解压；如果是直接的二进制，则改名
+        if [[ "$FILE_TYPE" == *"gzip compressed"* ]]; then
+          gzip -d -c mihomo.gz > mihomo
+        else
+          echo "⚠️ 检测到下载的并非 gz 压缩包，可能是直接的二进制流，正在直接转换..."
+          mv mihomo.gz mihomo
+        fi
+        
+        chmod +x mihomo
+        
+        # 6. 验证内核是否安装成功并打印当前最新版本号
+        ./mihomo -v
+
+    - name: 🏃 运行前置节点采集 (ProxyFlow-CI.py)
+      run: |
+        # 确保存在 urls.txt，然后运行你的采集脚本生成 all_proxies.json 和 all_links.txt
+        if [ -f "urls.txt" ]; then
+          python ProxyFlow-CI.py
+        else
+          echo "⚠️ 找不到 urls.txt，请确保仓库中包含该文件"
+          exit 1
+        fi
+
+    - name: ⚡ 运行 Mihomo 路由测速脚本
+      run: |
+        # 运行测速脚本（需配合下方修改后的 Python 脚本）
+        python speedtest_action.py
+
+    - name: 💾 将可用节点与测试结果提交回仓库
+      run: |
+        git config --global user.name "GitHub Actions Bot"
+        git config --global user.email "actions@github.com"
+        
+        # 检查是否有文件发生变动
+        git add .
+        if git diff --staged --quiet; then
+          echo "🎉 没有发现新数据变动，无需提交。"
+        else
+          git commit -m "🤖 自动同步: 更新节点有效性测试报告 [skip ci]"
+          git push
+        fi
