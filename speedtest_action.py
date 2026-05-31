@@ -33,17 +33,45 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml"):
         "socks-port": 7891,
         "allow-lan": False,
         "mode": "rule",
-        "log-level": "info", # 💡 调低日志等级，方便在 Actions 报错时排查
+        "log-level": "info",
         "external-controller": f"127.0.0.1:{CONTROLLER_PORT}",
-        "secret": "",        # 确保不设密码，方便 API 直接调用
+        "secret": "",        
         "proxies": []
     }
 
     with open("all_proxies.json", "r", encoding="utf-8") as jf:
         json_proxies = json.load(jf)
         for p in json_proxies:
+            # 过滤掉非内核的原生辅助字段
             clean_proxy = {k: v for k, v in p.items() if k not in ['fingerprint', 'timestamp', 'share_link', 'xray_config', 'source_urls']}
+            
+            # ✨【核心修复】将 alpn 从字符串平滑转换为 Mihomo 要求的 Slice (列表) 格式
+            if 'alpn' in clean_proxy and clean_proxy['alpn']:
+                alpn_val = clean_proxy['alpn']
+                if isinstance(alpn_val, str):
+                    # 如果字符串里包含逗号（如 "h2,http/1.1"），拆分成列表；否则单元素独立成列表
+                    if ',' in alpn_val:
+                        clean_proxy['alpn'] = [item.strip() for item in alpn_val.split(',') if item.strip()]
+                    else:
+                        clean_proxy['alpn'] = [alpn_val.strip()]
+                elif isinstance(alpn_val, list):
+                    # 已经是列表则保持不变
+                    pass
+                else:
+                    # 其它异常类型直接剔除，避免阻塞内核
+                    del clean_proxy['alpn']
+            
+            # 兼容性清洗：如果含有空字符串的 alpn、sni 等，直接移除该键，走内核默认缺省值
+            for optional_key in ['alpn', 'sni', 'host', 'path']:
+                if optional_key in clean_proxy and (clean_proxy[optional_key] == "" or clean_proxy[optional_key] is None):
+                    del clean_proxy[optional_key]
+
             config["proxies"].append(clean_proxy)
+
+    # 兜底防御：防止 proxies 数组为空导致内核启动失败
+    if not config["proxies"]:
+        print("⚠️ 警告: 转换后的有效 proxies 数组为空，跳过本次测速流程。")
+        return False
 
     config["proxy-groups"] = [
         {"name": "测速分组", "type": "select", "proxies": [p["name"] for p in config["proxies"]]}
