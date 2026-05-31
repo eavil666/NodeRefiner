@@ -40,6 +40,11 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
         if not isinstance(p, dict):
             continue
             
+        # 0. 严格阻断无名或残缺幽灵节点
+        node_name = str(p.get('name', '')).strip()
+        if not node_name or node_name == "None":
+            continue
+
         # 提取纯净的核心代理属性
         clean_proxy = {
             k: v for k, v in p.items() 
@@ -59,19 +64,22 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
         # 2. 协议特异性强补全与逻辑防御
         ptype_lower = str(clean_proxy.get('type', '')).lower()
         
-        # ✨【针对本次报错的终极防护】：强制给 WireGuard 补全本地地址 (ip 字段)
+        # 针对 WireGuard 补全本地地址 (ip 字段)
         if ptype_lower in ['wireguard', 'wg']:
-            # 如果没有 'ip' 或者 'ip' 是空的
             if 'ip' not in clean_proxy or not str(clean_proxy['ip']).strip() or clean_proxy['ip'] == "None":
-                # 尝试拿 host 字段作为兜底
                 if 'host' in clean_proxy and str(clean_proxy['host']).strip() and clean_proxy['host'] != "None":
                     clean_proxy['ip'] = clean_proxy['host']
                 else:
-                    # 终极无赖兜底，给一个标准的 WG 本地内网 IP
                     clean_proxy['ip'] = "10.0.0.2"
-            
-            # 同时：Mihomo 解析 WireGuard 时如果带有不认识的 'host' 或是空 'host' 会报语法隐患，在这里顺手移除
             clean_proxy.pop('host', None)
+
+        # ✨【针对本次报错的防御】：补全 TUIC 协议可能触发的凭证或传输层解析缺陷
+        elif ptype_lower == 'tuic':
+            # Mihomo 的 tuic 核心字段包含：uuid/password (二选一)
+            if 'uuid' not in clean_proxy and 'password' in clean_proxy:
+                clean_proxy['uuid'] = clean_proxy['password'] # 相互对齐做兼容
+            # 如果配置里带有一些多余的不规范字段干扰了内核对 transport 的自动推导，给予移除
+            clean_proxy.pop('transport', None)
 
         # 3. 彻底驯服 alpn 属性
         if 'alpn' in clean_proxy and clean_proxy['alpn']:

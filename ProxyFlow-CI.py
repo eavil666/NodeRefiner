@@ -435,16 +435,35 @@ class YAMLConfigProcessor:
             logger.warning(f"⚠️ [源头熔断] 节点 '{name_val}' 端口解析异常，自动隔离。")
             return False, None
 
-        # 3. WireGuard (wg) 专属核心字段熔断与格式收敛
+        # 3. ✨【新规防闪退】针对新协议进行鉴权字段强制阻断（防止报 unset fields: username/uuid）
+        if ptype in ['tuic', 'anytls']:
+            # tuic / anytls 必须拥有 uuid 或者是传统的 token/password
+            uuid_val = str(proxy.get('uuid', '')).strip()
+            pass_val = str(proxy.get('password', '')).strip()
+            if not uuid_val and not pass_val:
+                logger.warning(f"⚠️ [源头熔断] TUIC/AnyTLS 节点 '{name_val}' 缺失凭证(uuid/password)，直接拦截。")
+                return False, None
+
+        elif ptype in ['hysteria2', 'hy2', 'trojan']:
+            # Hysteria2 / Trojan 必须拥有密码
+            if not str(proxy.get('password', '')).strip():
+                logger.warning(f"⚠️ [源头熔断] Hysteria2/Trojan 节点 '{name_val}' 缺失 password，直接拦截。")
+                return False, None
+
+        elif ptype in ['vless', 'vmess']:
+            # Vless / Vmess 必须拥有 UUID
+            if not str(proxy.get('uuid', '')).strip():
+                logger.warning(f"⚠️ [源头熔断] {proxy['type']} 节点 '{name_val}' 缺失 uuid，直接拦截。")
+                return False, None
+
+        # 4. WireGuard (wg) 专属核心字段熔断与格式收敛
         if ptype in ['wireguard', 'wg']:
-            # 兼容带有中划线和下划线的两种写法并收敛
             private_key = str(proxy.get('private-key', proxy.get('private_key', ''))).strip()
             if not private_key or private_key.lower() == "none":
                 logger.warning(f"⚠️ [源头熔断] WG节点 '{name_val}' 缺失核心秘钥 private-key，阻止其进入测速流。")
                 return False, None
-            proxy['private-key'] = private_key # 确保统一使用中划线命名兼容Mihomo
+            proxy['private-key'] = private_key 
 
-            # 驯服局域网虚拟本端 IP (Clash规范中映射到 'ip' 字段且强校验必须为单字符串)
             ip_field = proxy.get('ip', '10.0.0.2')
             if isinstance(ip_field, list):
                 if len(ip_field) > 0:
@@ -457,14 +476,14 @@ class YAMLConfigProcessor:
             if not proxy['ip'] or proxy['ip'].lower() == "none":
                 proxy['ip'] = "10.0.0.2"
 
-        # 4. Vmess 专属核心字段 alterId 自动对齐强补全
+        # 5. Vmess 专属核心字段 alterId 自动对齐强补全
         elif ptype == 'vmess':
             try:
                 proxy['alterId'] = int(proxy.get('alterId', 0))
             except:
                 proxy['alterId'] = 0
 
-        # 5. 跨协议高危传输层字段 alpn 类型擦除与 Slice 级联对齐
+        # 6. 跨协议高危传输层字段 alpn 类型擦除与 Slice 级联对齐
         if 'alpn' in proxy and proxy['alpn']:
             raw_alpn = proxy['alpn']
             processed_alpn = []
@@ -477,13 +496,11 @@ class YAMLConfigProcessor:
                     processed_alpn = [raw_alpn.strip()]
             
             if processed_alpn:
-                # 转换为标准 Clash/Mihomo 的多元素标量数组格式
                 proxy['alpn'] = processed_alpn
             else:
-                # 如果转换出来是脏数据列表，直接剔除，使其走内核握手缺省，防止断言闪退
                 if 'alpn' in proxy: del proxy['alpn']
 
-        # 6. 清理可能引起内核类型映射失败的空白字符串
+        # 7. 清理可能引起内核类型映射失败的空白字符串
         for uncompliant_key in ['sni', 'host', 'path']:
             if uncompliant_key in proxy and (proxy[uncompliant_key] == "" or proxy[uncompliant_key] is None):
                 del proxy[uncompliant_key]
