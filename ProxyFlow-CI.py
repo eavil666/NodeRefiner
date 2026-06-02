@@ -16,12 +16,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # 禁用SSL警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+OUTPUT_DIR = 'output'
+LOG_DIR = 'logs'
+os.makedirs(LOG_DIR, exist_ok=True)
+
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('url_processor.log', encoding='utf-8'),
+        logging.FileHandler(os.path.join(LOG_DIR, 'url_processor.log'), encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -270,7 +274,7 @@ class ProxyInfo:
 
 class DuplicateManager:
     """全局增量重复数据管理器"""
-    def __init__(self, data_file: str = 'processed_proxies.json'):
+    def __init__(self, data_file: str = os.path.join(OUTPUT_DIR, 'processed_proxies.json')):
         self.data_file = data_file
         self.processed_proxies: Dict[str, Dict] = {}  
         self.processed_urls: Set[str] = set()  
@@ -740,11 +744,13 @@ class YAMLConfigProcessor:
 
 def main():
     INPUT_FILE = "urls.txt"
-    OUTPUT_CSV = "all_proxies.csv"
-    OUTPUT_JSON = "all_proxies.json"
-    OUTPUT_LINKS = "all_links.txt"
-    FAILED_LOG = "failed_urls.txt"
+    OUTPUT_CSV = os.path.join(OUTPUT_DIR, "all_proxies.csv")
+    OUTPUT_JSON = os.path.join(OUTPUT_DIR, "all_proxies.json")
+    OUTPUT_LINKS = os.path.join(OUTPUT_DIR, "all_links.txt")
+    FAILED_LOG = os.path.join(OUTPUT_DIR, "failed_urls.txt")
     
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
     processor = YAMLConfigProcessor(
         timeout=20,
         retry_count=2,
@@ -763,6 +769,8 @@ def main():
     )
 
 if __name__ == "__main__":
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(LOG_DIR, exist_ok=True)
     if not os.path.exists("urls.txt"):
         with open("urls.txt", "w", encoding="utf-8") as f:
             f.write("# 在此填入订阅源链接，每行一个\n")
