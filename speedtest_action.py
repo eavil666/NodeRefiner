@@ -5,11 +5,17 @@ import os
 import requests
 import socket
 from urllib.parse import quote
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ⚙️ Linux 运行环境配置
 MIHOMO_PATH = "./mihomo"
 CONTROLLER_PORT = 9090
 API_URL = f"http://127.0.0.1:{CONTROLLER_PORT}"
+
+# ⚡ 并发性能配置
+MAX_WORKERS = 60       # 同时下发测速的线程数（Actions 环境下建议 50-80）
+TIMEOUT_MS = 2500      # 节点内核测速超时时间（2.5秒）
+HTTP_TIMEOUT = 4       # Python 接口请求硬超时时间（略大于内核超时即可）
 
 def is_port_open(port: int, host: str = "127.0.0.1") -> bool:
     """用原生 Socket 检查指定端口是否已经开放监听"""
@@ -36,18 +42,13 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
             return False
         
     proxies_to_load = []
-    
-    # 1. 用于节点名称全域绝对去重与自动重命名的计数器
     seen_names = {} 
     
-    # 内核支持的标准协议白名单
     SUPPORTED_TYPES = {
         'ss', 'shadowsocks', 'snell', 'vmess', 'vless', 
         'trojan', 'hysteria', 'hysteria2', 'hy2', 'tuic', 
         'wireguard', 'wg', 'ssr', 'shadowsocksr', 'socks5', 'http'
     }
-
-    # SSR 协议内核允许的合法混淆白名单
     VALID_SSR_OBFS = {'plain', 'http_simple', 'http_post', 'random_head', 'tls1.2_ticket_auth', 'tls1.2_ticket_fastauth'}
 
     for idx, p in enumerate(json_proxies):
@@ -60,35 +61,29 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
         if not raw_name or raw_name == "None" or raw_name == "":
             continue
             
-        # 核心防御：非白名单协议直接过滤
         if ptype_lower not in SUPPORTED_TYPES:
             continue
 
-        # 提取纯净的核心代理属性
         clean_proxy = {
             k: v for k, v in p.items() 
             if k not in ['fingerprint', 'timestamp', 'share_link', 'xray_config', 'source_urls', 'source_url']
         }
         
-        # 修正规范化协议名称
         clean_proxy['type'] = ptype_lower
         if ptype_lower == 'wg': clean_proxy['type'] = 'wireguard'
         if ptype_lower == 'hy2': clean_proxy['type'] = 'hysteria2'
         if ptype_lower == 'shadowsocks': clean_proxy['type'] = 'ss'
         if ptype_lower == 'shadowsocksr': clean_proxy['type'] = 'ssr'
 
-        # ✨【针对本次报错的致命防护】：全局节点名称去重与加编号重命名逻辑
         if raw_name not in seen_names:
             seen_names[raw_name] = 1
             clean_proxy['name'] = raw_name
         else:
-            # 发现同名碰撞，自动附加重名后缀编号（例如 🇸🇬 新加坡2_dup1）
             count = seen_names[raw_name]
             final_name = f"{raw_name}_dup{count}"
             seen_names[raw_name] += 1
             clean_proxy['name'] = final_name
 
-        # 2. 字段名称平滑映射 (下划线转中划线)
         if 'skip_cert_verify' in clean_proxy:
             clean_proxy['skip-cert-verify'] = clean_proxy.pop('skip_cert_verify')
         if 'private_key' in clean_proxy:
@@ -100,10 +95,8 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
         if 'obfs_password' in clean_proxy:
             clean_proxy['obfs-password'] = clean_proxy.pop('obfs_password')
 
-        # 3. 协议特异性健壮校验与防闪退熔断
         is_corrupted = False
         
-        # 清洗 SSR 协议混淆缺陷
         if clean_proxy['type'] == 'ssr':
             ssr_obfs = str(clean_proxy.get('obfs', '')).strip().lower()
             if not ssr_obfs or ssr_obfs == 'none' or ssr_obfs not in VALID_SSR_OBFS:
@@ -113,7 +106,6 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
             if not str(clean_proxy.get('protocol', '')).strip():
                 clean_proxy['protocol'] = 'origin'
 
-        # 针对 TUIC 协议防御
         elif clean_proxy['type'] == 'tuic':
             uuid_val = str(clean_proxy.get('uuid', clean_proxy.get('password', clean_proxy.get('token', '')))).strip()
             if not uuid_val or uuid_val == "None":
@@ -124,17 +116,14 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
             clean_proxy.pop('transport', None)
             clean_proxy.pop('username', None)
 
-        # 针对 Hysteria / Hysteria2 协议防御
         elif clean_proxy['type'] in ['hysteria', 'hysteria2']:
             if not str(clean_proxy.get('password', '')).strip() or clean_proxy.get('password') == "None":
                 is_corrupted = True
 
-        # 针对 Vmess / Vless 协议防御
         elif clean_proxy['type'] in ['vmess', 'vless']:
             if not str(clean_proxy.get('uuid', '')).strip() or clean_proxy.get('uuid') == "None":
                 is_corrupted = True
 
-        # 针对 WireGuard 补全本地地址
         elif clean_proxy['type'] == 'wireguard':
             if 'ip' not in clean_proxy or not str(clean_proxy['ip']).strip() or clean_proxy['ip'] == "None":
                 if 'host' in clean_proxy and str(clean_proxy['host']).strip() and clean_proxy['host'] != "None":
@@ -148,7 +137,6 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
         if is_corrupted:
             continue
 
-        # 4. 混淆(obfs)字段净化 (针对标准 SS 协议)
         if 'obfs' in clean_proxy and clean_proxy['type'] != 'ssr':
             obfs_type = str(clean_proxy['obfs']).strip().lower()
             if obfs_type and obfs_type != 'none':
@@ -157,12 +145,10 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
                     has_password = True
                 elif isinstance(clean_proxy.get('plugin-opts'), dict) and str(clean_proxy['plugin-opts'].get('password', '')).strip():
                     has_password = True
-                
                 if not has_password:
                     clean_proxy.pop('obfs', None)
                     clean_proxy.pop('obfs-password', None)
 
-        # 5. 彻底驯服 alpn 属性
         if 'alpn' in clean_proxy and clean_proxy['alpn']:
             raw_alpn = clean_proxy['alpn']
             final_alpn = []
@@ -211,6 +197,20 @@ def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
     print(f"📊 测速配置文件组装完毕，共成功重命名冲突并载入 {len(proxies_to_load)} 个合规节点。")
     return True
 
+def test_single_proxy(name, test_url):
+    """【并发工作子单元】请求单节点测速 API 接口并返回延迟结果"""
+    encoded_name = quote(name)
+    test_api = f"{API_URL}/proxies/{encoded_name}/delay?url={quote(test_url)}&timeout={TIMEOUT_MS}"
+    try:
+        res = requests.get(test_api, timeout=HTTP_TIMEOUT)
+        if res.status_code == 200:
+            delay = res.json().get("delay", -1)
+            if delay > 0:
+                return name, delay
+    except:
+        pass
+    return name, -1
+
 def run_speedtest():
     config_file = "temp_mihomo_config.yaml"
     if not generate_temp_config(config_file):
@@ -247,7 +247,7 @@ def run_speedtest():
                     print(lf.read())
             return
         
-        print("⚡ 正在下发并行测速指令...")
+        print("⚡ 正在获取全量测速节点清单...")
         try:
             proxies_res = requests.get(f"{API_URL}/proxies", timeout=5).json()
         except Exception as e:
@@ -256,8 +256,41 @@ def run_speedtest():
         
         proxies_dict = proxies_res.get("proxies", {})
         test_url = "http://www.gstatic.com/generate_204"
-        timeout_ms = 3000
         
+        # 筛选出需要进行网络测试的有效代理节点
+        node_names = [
+            name for name, info in proxies_dict.items()
+            if info.get("type") not in ["Selector", "URLTest", "Fallback", "LoadBalance", "Direct", "Reject"]
+        ]
+        
+        total_nodes = len(node_names)
+        print(f"⚡ 开始多线程并发测速，并发规模: {MAX_WORKERS}，节点总数: {total_nodes} ...")
+        
+        valid_delays = {}
+        start_time = time.time()
+        
+        # ✨【高能优化核心】：启用线程池进行高并发请求下发
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            # 建立未来任务映射
+            future_to_node = {executor.submit(test_single_proxy, name, test_url): name for name in node_names}
+            
+            completed_count = 0
+            for future in as_completed(future_to_node):
+                name, delay = future.result()
+                completed_count += 1
+                
+                if delay > 0:
+                    valid_delays[name] = delay
+                    print(f"  [{completed_count}/{total_nodes}] ✅ [可用] {name} ── {delay}ms")
+                else:
+                    # 减少标准 Actions 打印日志噪音，死节点仅计数，不轰炸控制台
+                    if completed_count % 50 == 0 or completed_count == total_nodes:
+                        print(f"  进度通知: 已完成 {completed_count}/{total_nodes} 个节点的连通性初筛...")
+
+        elapsed_time = time.time() - start_time
+        print(f"⏱️ 并发测速洗白完成！耗时: {elapsed_time:.2f} 秒。成功命中可用节点: {len(valid_delays)} 个")
+
+        # 映射链接回填
         valid_nodes = []
         link_mapping = {}
         if os.path.exists("all_proxies.json"):
@@ -266,29 +299,11 @@ def run_speedtest():
                     if isinstance(item, dict) and 'name' in item:
                         link_mapping[item['name']] = item.get('share_link', '')
 
-        for name, info in proxies_dict.items():
-            if info.get("type") in ["Selector", "URLTest", "Fallback", "LoadBalance", "Direct", "Reject"]:
-                continue
-                
-            encoded_name = quote(name)
-            test_api = f"{API_URL}/proxies/{encoded_name}/delay?url={quote(test_url)}&timeout={timeout_ms}"
-            
-            try:
-                res = requests.get(test_api, timeout=4)
-                if res.status_code == 200:
-                    delay = res.json().get("delay", -1)
-                    if delay > 0:
-                        print(f"  ✅ [可用] {name} ── {delay}ms")
-                        
-                        # 映射逻辑兼容：如果是带重名后缀的节点（如 🇸🇬 新加坡2_dup1），回溯获取原始名字的分享链接
-                        lookup_name = name.split('_dup')[0]
-                        share_link = link_mapping.get(lookup_name, link_mapping.get(name, ''))
-                        if share_link:
-                            valid_nodes.append(share_link)
-                else:
-                    print(f"  ❌ [不可用/超时] {name}")
-            except:
-                print(f"  ❌ [物理连接异常] {name}")
+        for name in valid_delays.keys():
+            lookup_name = name.split('_dup')[0]
+            share_link = link_mapping.get(lookup_name, link_mapping.get(name, ''))
+            if share_link:
+                valid_nodes.append(share_link)
         
         output_file = "valid_links.txt"
         with open(output_file, "w", encoding="utf-8") as wf:
@@ -297,7 +312,7 @@ def run_speedtest():
             for link in valid_nodes:
                 wf.write(f"{link}\n")
                 
-        print(f"\n🎉 筛选完成！总计有效节点: {len(valid_nodes)} 个，已写入 {output_file}")
+        print(f"\n🎉 筛选完成！已将 {len(valid_nodes)} 个高响应节点写入 {output_file}")
             
     except Exception as e:
         print(f"💥 运行期间发生未预期的脚本错误: {e}")
