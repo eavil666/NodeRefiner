@@ -41,15 +41,32 @@ jobs:
             exit 1
           fi
 
-      - name: ⚙️ 步骤 2：下载并配置最新版 Mihomo (Clash.Meta) 内核
+      - name: ⚙️ 下载并安装 Mihomo (Clash.Meta) 内核
         run: |
-          echo "正在获取 Mihomo Linux-AMD64 稳定版内核..."
-          # 从官方 Alpha 或 Release 分支拉取纯净二进制文件
-          curl -L -o mihomo.tar.gz https://github.com/MetaCubeX/Mihomo/releases/download/v1.18.9/mihomo-linux-amd64-v1.18.9.tar.gz
-          tar -xzf mihomo.tar.gz
-          mv mihomo-linux-amd64 mihomo
+          # 自动调用 GitHub API 获取最新的正式发布版本
+          DOWNLOAD_URL=$(curl -s https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | \
+            jq -r '.assets[] | select(.name | test("mihomo-linux-amd64.*\\.gz$")) | .browser_download_url' | head -n 1)
+
+          echo "🌐 探测到最新内核下载链接: $DOWNLOAD_URL"
+
+          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" = "null" ]; then
+            echo "⚠️ API 提取失败，启动官方 Latest 直链同步机制..."
+            DOWNLOAD_URL="https://github.com/MetaCubeX/mihomo/releases/latest/download/mihomo-linux-amd64.gz"
+          fi
+
+          curl -L -o mihomo.gz "$DOWNLOAD_URL"
+          FILE_TYPE=$(file -b mihomo.gz)
+          echo "📦 下载文件的实际类型为: $FILE_TYPE"
+
+          if [[ "$FILE_TYPE" == *"gzip compressed"* ]]; then
+            gzip -d -c mihomo.gz > mihomo
+          else
+            echo "⚠️ 检测到直接二进制流，正在直接转换..."
+            mv mihomo.gz mihomo
+          fi
+
           chmod +x mihomo
-          echo "✅ Mihomo 内核就绪。"
+          ./mihomo -v
 
       - name: ⚡ 步骤 3：拉起并发内核并下发初筛测速
         run: |
