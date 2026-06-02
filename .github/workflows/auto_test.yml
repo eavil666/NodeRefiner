@@ -88,15 +88,15 @@ jobs:
           mkdir -p "${ARCHIVE_DIR}"
           
           # 2. 健壮性文件备份：如果生成了测速结果，则强行拷贝到归档目录中
-          if [ -f "valid_links.txt" ]; then
-            cp "valid_links.txt" "${ARCHIVE_DIR}/valid_links.txt"
+          if [ -f "output/valid_links.txt" ]; then
+            cp "output/valid_links.txt" "${ARCHIVE_DIR}/valid_links.txt"
             echo "✅ 成功归档 valid_links.txt 到 ${ARCHIVE_DIR}/"
           else
             echo "⚠️ 警告: 未找到有效的 valid_links.txt 结果文件，跳过该项归档。"
           fi
           
-          if [ -f "all_proxies.json" ]; then
-            cp "all_proxies.json" "${ARCHIVE_DIR}/all_proxies.json"
+          if [ -f "output/all_proxies.json" ]; then
+            cp "output/all_proxies.json" "${ARCHIVE_DIR}/all_proxies.json"
             echo "✅ 成功归档全局纯净去重库 all_proxies.json 到 ${ARCHIVE_DIR}/"
           fi
 
@@ -105,7 +105,7 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           
-          git add valid_links.txt archived/
+          git add output/valid_links.txt archived/
           
           # 只有当文件发生实质性改动时才提交，防止 Actions 报空提交错误
           if git diff --staged --quiet; then

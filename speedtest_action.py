@@ -7,6 +7,11 @@ import socket
 from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+OUTPUT_DIR = 'output'
+LOG_DIR = 'logs'
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
+
 # ⚙️ Linux 运行环境配置
 MIHOMO_PATH = "./mihomo"
 CONTROLLER_PORT = 9090
@@ -28,13 +33,14 @@ def is_port_open(port: int, host: str = "127.0.0.1") -> bool:
     except:
         return False
 
-def generate_temp_config(config_path: str = "temp_mihomo_config.yaml") -> bool:
+def generate_temp_config(config_path: str = os.path.join(OUTPUT_DIR, "temp_mihomo_config.yaml")) -> bool:
     """读取 all_proxies.json 并生成用于测速的临时 YAML 配置文件"""
-    if not os.path.exists("all_proxies.json"):
+    input_json = os.path.join(OUTPUT_DIR, "all_proxies.json")
+    if not os.path.exists(input_json):
         print("❌ 错误: 找不到全局纯净去重库 all_proxies.json，请确保前置抓取步骤已成功。")
         return False
 
-    with open("all_proxies.json", "r", encoding="utf-8") as jf:
+    with open(input_json, "r", encoding="utf-8") as jf:
         try:
             json_proxies = json.load(jf)
         except Exception as e:
@@ -212,7 +218,7 @@ def test_single_proxy(name, test_url):
     return name, -1
 
 def run_speedtest():
-    config_file = "temp_mihomo_config.yaml"
+    config_file = os.path.join(OUTPUT_DIR, "temp_mihomo_config.yaml")
     if not generate_temp_config(config_file):
         return
 
@@ -222,14 +228,15 @@ def run_speedtest():
 
     print("🚀 正在拉起后台 Mihomo 内核进程...")
     process = None
+    kernel_log = os.path.join(LOG_DIR, "mihomo_kernel.log")
     try:
-        log_file = open("mihomo_kernel.log", "w")
+        log_file = open(kernel_log, "w")
         process = subprocess.Popen(
             [MIHOMO_PATH, "-f", config_file, "-d", "./clash_dummy"],
             stdout=log_file,
             stderr=log_file
         )
-        
+
         print("⏳ 正在等待 Mihomo 外部控制器 (API) 端口开放...")
         api_ready = False
         for i in range(15):
@@ -241,9 +248,9 @@ def run_speedtest():
             
         if not api_ready:
             print("❌ 严重错误: Mihomo 内核在 15 秒内未能成功监听 9090 端口！")
-            if os.path.exists("mihomo_kernel.log"):
+            if os.path.exists(kernel_log):
                 print("\n📋 ─── 以下为 Mihomo 内核崩溃追踪日志 ───")
-                with open("mihomo_kernel.log", "r") as lf:
+                with open(kernel_log, "r") as lf:
                     print(lf.read())
             return
         
@@ -293,8 +300,9 @@ def run_speedtest():
         # 映射链接回填
         valid_nodes = []
         link_mapping = {}
-        if os.path.exists("all_proxies.json"):
-            with open("all_proxies.json", "r", encoding="utf-8") as jf:
+        input_json = os.path.join(OUTPUT_DIR, "all_proxies.json")
+        if os.path.exists(input_json):
+            with open(input_json, "r", encoding="utf-8") as jf:
                 for item in json.load(jf):
                     if isinstance(item, dict) and 'name' in item:
                         link_mapping[item['name']] = item.get('share_link', '')
@@ -305,7 +313,7 @@ def run_speedtest():
             if share_link:
                 valid_nodes.append(share_link)
         
-        output_file = "valid_links.txt"
+        output_file = os.path.join(OUTPUT_DIR, "valid_links.txt")
         with open(output_file, "w", encoding="utf-8") as wf:
             wf.write("# 🌐 通过 GitHub Actions 自动化初筛的高可用代理列表\n")
             wf.write(f"# 🕒 更新时间: {time.strftime('%Y-%m-%d %H:%M:%S')} UTC\n\n")
@@ -323,10 +331,10 @@ def run_speedtest():
             process.wait()
         if os.path.exists(config_file):
             os.remove(config_file)
-        if os.path.exists("mihomo_kernel.log"):
-            try: log_file.close() 
+        if os.path.exists(kernel_log):
+            try: log_file.close()
             except: pass
-            os.remove("mihomo_kernel.log")
+            os.remove(kernel_log)
 
 if __name__ == "__main__":
     run_speedtest()

@@ -11,16 +11,21 @@ import urllib3
 import base64
 from urllib.parse import urlparse, quote
 from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 禁用SSL警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+OUTPUT_DIR = 'output'
+LOG_DIR = 'logs'
+os.makedirs(LOG_DIR, exist_ok=True)
 
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('url_processor.log', encoding='utf-8'),
+        logging.FileHandler(os.path.join(LOG_DIR, 'url_processor.log'), encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -269,7 +274,7 @@ class ProxyInfo:
 
 class DuplicateManager:
     """全局增量重复数据管理器"""
-    def __init__(self, data_file: str = 'processed_proxies.json'):
+    def __init__(self, data_file: str = os.path.join(OUTPUT_DIR, 'processed_proxies.json')):
         self.data_file = data_file
         self.processed_proxies: Dict[str, Dict] = {}  
         self.processed_urls: Set[str] = set()  
@@ -329,28 +334,31 @@ class DuplicateManager:
             self.processed_proxies[fingerprint] = proxy_data
 
 class YAMLConfigProcessor:
-    """YAML 配置文件处理器（内置自适应高智能 HTTP/HTTPS 探测获取算法）"""
+    """YAML 配置文件处理器（内置并发高智能 HTTP/HTTPS 获取算法）"""
     def __init__(self, timeout: int = 15, retry_count: int = 2, 
                  verify_ssl: bool = False, follow_redirects: bool = True,
-                 skip_processed_urls: bool = True):
+                 skip_processed_urls: bool = True, max_workers: int = 15):
         self.timeout = timeout
         self.retry_count = retry_count
         self.verify_ssl = verify_ssl
         self.follow_redirects = follow_redirects
         self.skip_processed_urls = skip_processed_urls
-        
+        self.max_workers = max_workers
         self.dup_manager = DuplicateManager()
-        self.session = requests.Session()
-        self.session.headers.update({
+        
+    def _create_thread_session(self, verify_ssl: bool) -> requests.Session:
+        """为每个子线程创建独立的、防冲突的网络会话客户端"""
+        session = requests.Session()
+        session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
             'Connection': 'keep-alive'
         })
-        adapter = requests.adapters.HTTPAdapter(pool_connections=15, pool_maxsize=15, max_retries=2)
-        self.session.mount('http://', adapter)
-        self.session.mount('https://', adapter)
-        if not verify_ssl:
-            self.session.verify = False
+        adapter = requests.adapters.HTTPAdapter(pool_connections=2, pool_maxsize=2, max_retries=1)
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+        session.verify = verify_ssl
+        return session
     
     def normalize_url(self, url: str) -> str:
         if not url: return url
@@ -375,77 +383,63 @@ class YAMLConfigProcessor:
         ]
         return any(indicator in content.lower() for indicator in proxy_indicators)
     
-    def get_config_from_url(self, url: str) -> Optional[str]:
+    def fetch_single_url_worker(self, url: str, index_str: str) -> Tuple[str, Optional[str], str]:
+        """【并发子任务工作元】负责单个 URL 的弹性下载请求与初筛格式校验"""
         if self.skip_processed_urls and self.dup_manager.is_url_processed(url):
-            logger.info(f"⏭️ 跳过历史已成功处理的URL: {url}")
-            return None
-        
+            return url, None, "SKIP"
+            
         normalized_url = self.normalize_url(url)
         current_verify = self.verify_ssl
         backoff_delay = 1.5  
+        session = self._create_thread_session(current_verify)
         
         for attempt in range(self.retry_count + 1):
             try:
                 current_timeout = self.timeout if attempt > 0 else 5.0
-                logger.info(f"🔍 [{attempt + 1}/{self.retry_count + 1}] 正在智能探测源: {normalized_url}")
+                logger.info(f"🔍 [{index_str}][尝试 {attempt + 1}/{self.retry_count + 1}] 正在智能抓取: {normalized_url}")
                 
-                probe = self.session.head(
+                probe = session.head(
                     normalized_url, 
                     timeout=current_timeout,
-                    allow_redirects=self.follow_redirects, 
-                    verify=current_verify
+                    allow_redirects=self.follow_redirects
                 )
                 
                 if probe.status_code in [404, 410, 502, 504] and attempt == self.retry_count:
-                    logger.warning(f"❌ 明确的死链状态码 ({probe.status_code})，停止处理")
-                    return None
+                    return url, None, f"HTTP_{probe.status_code}"
                 
-                if probe.status_code in [200, 301, 302, 307, 308]:
-                    content_type = probe.headers.get('Content-Type', '').lower()
-                    if 'text/html' in content_type:
-                        logger.debug(f"⚠️ 探测到内容类型为 HTML，可能已被重定向到报错或人机验证页")
-
-                response = self.session.get(
+                response = session.get(
                     normalized_url, 
                     timeout=self.timeout,
-                    allow_redirects=self.follow_redirects, 
-                    verify=current_verify
+                    allow_redirects=self.follow_redirects
                 )
                 
                 if response.status_code == 200:
                     content = response.text
                     if self.is_yaml_content(content):
-                        return content
+                        return url, content, "SUCCESS"
                     
                     cleaned = self.clean_content(content)
                     if self.is_yaml_content(cleaned):
-                        return cleaned
+                        return url, cleaned, "SUCCESS"
                     
-                    logger.warning(f"⚠️ URL 响应成功但内容格式不属于有效的 Clash 配置")
-                    return None  
+                    return url, None, "INVALID_YAML_FORMAT"
 
-            except requests.exceptions.SSLError as ssl_err:
+            except requests.exceptions.SSLError:
                 if current_verify:
-                    logger.warning(f"🔒 捕获 HTTPS 证书安全错误，正在自动降级验证强度并重试... 错误: {ssl_err}")
                     current_verify = False
+                    session.verify = False
                     continue
             except requests.exceptions.Timeout:
-                logger.warning(f"⏱️ 连接超时 (Timeout) 发生于第 {attempt + 1} 轮尝试")
-            except requests.exceptions.RequestException as req_err:
+                pass
+            except requests.exceptions.RequestException:
                 if normalized_url.startswith('https://'):
-                    http_url = normalized_url.replace('https://', 'http://')
-                    logger.info(f"🌐 HTTPS 握手失败，尝试平滑降级到纯 HTTP 协议: {http_url}")
-                    normalized_url = http_url
+                    normalized_url = normalized_url.replace('https://', 'http://')
                     continue
-                logger.warning(f"🌐 网络传输或连接异常: {req_err}")
             
             if attempt < self.retry_count:
-                actual_delay = backoff_delay * (1.5 ** attempt)
-                logger.info(f"⏳ 触发动态退避机制，等待 {actual_delay:.1f} 秒后发起下一轮弹性重试...")
-                time.sleep(actual_delay)
+                time.sleep(backoff_delay * (1.2 ** attempt))
                 
-        logger.error(f"❌ 历经 {self.retry_count + 1} 轮智能探测后，依然无法成功提取配置: {url}")
-        return None
+        return url, None, "FAILED_TIMEOUT_OR_NETWORK"
     
     def clean_content(self, content: str) -> str:
         if not content: return content
@@ -470,12 +464,7 @@ class YAMLConfigProcessor:
                     cleaned_lines.append(line)
         return '\n'.join(cleaned_lines)
 
-    # ✨✨✨【核心新规：前置清洗熔断过滤器】✨✨✨
     def validate_and_clean_proxy_dict(self, proxy: dict, idx: int, source_url: str) -> Tuple[bool, Optional[dict]]:
-        """
-        在提取和组装 ProxyInfo 实体之前进行严格的语法与协议强校验。
-        返回 (是否合格, 清洗纠正后的数据字典)
-        """
         if not isinstance(proxy, dict):
             return False, None
 
@@ -483,58 +472,39 @@ class YAMLConfigProcessor:
         server_addr = str(proxy.get('server', '') or proxy.get('ip', '')).strip()
         name_val = str(proxy.get('name', '')).strip()
 
-        # 1. 必填骨架校验
         if not ptype or not server_addr or not name_val:
-            logger.debug(f"⏭️ [源头熔断] 节点(索引:{idx}) 缺少 type, server 或 name 基本属性，予以丢弃。")
             return False, None
 
-        # 2. 端口强合规校验
         try:
             port_val = int(proxy.get('port', 0))
-            if port_val <= 0 or port_val > 65535:
-                logger.warning(f"⚠️ [源头熔断] 节点 '{name_val}' 端口范围不合法: {port_val}，自动隔离。")
-                return False, None
+            if port_val <= 0 or port_val > 65535: return False, None
             proxy['port'] = port_val
         except:
-            logger.warning(f"⚠️ [源头熔断] 节点 '{name_val}' 端口解析异常，自动隔离。")
             return False, None
 
-        # 3. ✨【新规防闪退】混淆(obfs)字段深度清洗防御 (防止报 missing obfs password)
         if 'obfs' in proxy:
             obfs_val = proxy['obfs']
-            # 如果 obfs 字段本身是布尔值 True，或者字符串 "shadowsocks", "http" 等，需要检查密码
             if obfs_val and str(obfs_val).lower() != 'none':
-                # 检查是否存在对应的 obfs-password
                 obfs_pass = proxy.get('obfs-password', proxy.get('obfs_password', ''))
-                # 如果没有独立密码，再检查是否存在于 plugin-opts 中
                 if not obfs_pass and isinstance(proxy.get('plugin-opts'), dict):
                     obfs_pass = proxy['plugin-opts'].get('password', '')
-                
-                # 如果开启了混淆却找不到任何密码凭证，直接剔除混淆以防内核报错闪退（降级为原生传输测速）
                 if not str(obfs_pass).strip():
-                    logger.warning(f"⚠️ [前置净化] 节点 '{name_val}' 开启了 obfs 却缺失密码，已强制关闭其混淆特性。")
                     proxy.pop('obfs', None)
                     proxy.pop('obfs-password', None)
                     proxy.pop('obfs_password', None)
 
-        # 4. 针对新协议进行鉴权字段强制阻断（防止报 unset fields）
         if ptype in ['tuic', 'anytls']:
             uuid_val = str(proxy.get('uuid', '')).strip()
             pass_val = str(proxy.get('password', '')).strip()
-            if not uuid_val and not pass_val:
-                return False, None
+            if not uuid_val and not pass_val: return False, None
         elif ptype in ['hysteria2', 'hy2', 'trojan']:
-            if not str(proxy.get('password', '')).strip():
-                return False, None
+            if not str(proxy.get('password', '')).strip(): return False, None
         elif ptype in ['vless', 'vmess']:
-            if not str(proxy.get('uuid', '')).strip():
-                return False, None
+            if not str(proxy.get('uuid', '')).strip(): return False, None
 
-        # 5. WireGuard (wg) 专属核心字段熔断与格式收敛
         if ptype in ['wireguard', 'wg']:
             private_key = str(proxy.get('private-key', proxy.get('private_key', ''))).strip()
-            if not private_key or private_key.lower() == "none":
-                return False, None
+            if not private_key or private_key.lower() == "none": return False, None
             proxy['private-key'] = private_key 
 
             ip_field = proxy.get('ip', '10.0.0.2')
@@ -542,15 +512,12 @@ class YAMLConfigProcessor:
                 proxy['ip'] = str(ip_field[0]).strip() if len(ip_field) > 0 else "10.0.0.2"
             else:
                 proxy['ip'] = str(ip_field).strip()
-            if not proxy['ip'] or proxy['ip'].lower() == "none":
-                proxy['ip'] = "10.0.0.2"
+            if not proxy['ip'] or proxy['ip'].lower() == "none": proxy['ip'] = "10.0.0.2"
 
-        # 6. Vmess 专属核心字段 alterId 自动对齐强补全
         elif ptype == 'vmess':
             try: proxy['alterId'] = int(proxy.get('alterId', 0))
             except: proxy['alterId'] = 0
 
-        # 7. 跨协议高危传输层字段 alpn 类型擦除与 Slice 级联对齐
         if 'alpn' in proxy and proxy['alpn']:
             raw_alpn = proxy['alpn']
             processed_alpn = []
@@ -561,12 +528,9 @@ class YAMLConfigProcessor:
                     processed_alpn = [item.strip() for item in raw_alpn.split(',') if item.strip()]
                 else:
                     processed_alpn = [raw_alpn.strip()]
-            if processed_alpn:
-                proxy['alpn'] = processed_alpn
-            else:
-                if 'alpn' in proxy: del proxy['alpn']
+            if processed_alpn: proxy['alpn'] = processed_alpn
+            else: proxy.pop('alpn', None)
 
-        # 8. 清理可能引起内核类型映射失败的空白字符串
         for uncompliant_key in ['sni', 'host', 'path']:
             if uncompliant_key in proxy and (proxy[uncompliant_key] == "" or proxy[uncompliant_key] is None):
                 del proxy[uncompliant_key]
@@ -574,34 +538,24 @@ class YAMLConfigProcessor:
         return True, proxy
     
     def extract_all_proxies(self, config_content: str, source_url: str) -> List[ProxyInfo]:
-        """从拉取的 YAML 配置中精准提取代理项（已集成前置强校验机制与 WireGuard 本地 IP 固化）"""
         all_proxies = []
         try:
             config_data = None
-            try:
-                config_data = yaml.safe_load(config_content)
+            try: config_data = yaml.safe_load(config_content)
             except yaml.YAMLError:
                 cleaned = self.clean_yaml_content(config_content)
                 try: config_data = yaml.safe_load(cleaned)
                 except: pass
             
-            if not config_data or 'proxies' not in config_data:
-                return all_proxies
-            
+            if not config_data or 'proxies' not in config_data: return all_proxies
             proxies = config_data['proxies']
             if not isinstance(proxies, list): return all_proxies
             
             for idx, proxy in enumerate(proxies):
                 try:
-                    # [调用前置过滤器] 在这里拦截、清洗与熔断
                     is_pass, cleaned_proxy = self.validate_and_clean_proxy_dict(proxy, idx, source_url)
-                    if not is_pass or not cleaned_proxy:
-                        continue # 被安全隔离熔断，直接跳过处理下一个节点
+                    if not is_pass or not cleaned_proxy: continue
 
-                    ptype = cleaned_proxy['type'].lower()
-                    server_addr = cleaned_proxy['server']
-                    
-                    # 局域网虚拟客户端 IP / Reserved 数据集数组处理
                     ip_field = cleaned_proxy.get('ip', '10.0.0.2')
                     if isinstance(ip_field, list): ip_field = ",".join(ip_field)
                     reserved_field = cleaned_proxy.get('reserved', '')
@@ -610,7 +564,7 @@ class YAMLConfigProcessor:
                     proxy_info = ProxyInfo(
                         name=cleaned_proxy['name'],
                         type=cleaned_proxy['type'],
-                        server=server_addr,
+                        server=cleaned_proxy['server'],
                         port=cleaned_proxy['port'],
                         cipher=str(cleaned_proxy.get('cipher', '')),
                         password=str(cleaned_proxy.get('password', '')),
@@ -620,7 +574,6 @@ class YAMLConfigProcessor:
                         udp=bool(cleaned_proxy.get('udp', True)),
                         alterId=int(cleaned_proxy.get('alterId', 0)),
                         sni=str(cleaned_proxy.get('sni', '')),
-                        # ✨【关键修复】让 host 存放清洗好的本地 IP，并保证 cleaned_proxy 的原生属性也留存
                         host=str(ip_field), 
                         path=str(cleaned_proxy.get('path', '')),
                         security=str(cleaned_proxy.get('security', '')),
@@ -640,16 +593,12 @@ class YAMLConfigProcessor:
                         reserved=str(reserved_field),
                         mtu=int(cleaned_proxy.get('mtu', 1420))
                     )
-                    
-                    # ✨ 动态追加一个 ip 属性到对象，确保 to_dict() 时能顺理成章进入 JSON 字典
                     proxy_info.ip = str(ip_field)
-                    
                     all_proxies.append(proxy_info)
-                except Exception as e:
-                    logger.error(f"构造代理实体发生细节异常: {e}, 略过损坏节点数据项")
-            logger.info(f"节点映射成功 ── 成功安全转化 {len(all_proxies)} 个高规范可用节点实体")
-        except Exception as e:
-            logger.error(f"提取代理元数据数组发生阻断: {e}")
+                except:
+                    pass
+        except:
+            pass
         return all_proxies
     
     def clean_yaml_content(self, content: str) -> str:
@@ -667,139 +616,148 @@ class YAMLConfigProcessor:
         except Exception as e:
             logger.error(f"无法正确读取 URL 载入配置文件: {e}")
         return urls
-    
-    def save_proxies_with_dedup(self, url: str, proxies: List[ProxyInfo], 
-                               output_csv: str, output_json: str, output_links: str) -> Dict[str, int]:
-        stats = {'total': len(proxies), 'new': 0, 'duplicate': 0, 'error': 0}
-        new_proxies = []
-        
-        for proxy_info in proxies:
+
+    def _batch_save_proxies_to_disk(self, valid_results: List[Tuple[str, List[ProxyInfo]]], output_csv: str, output_json: str, output_links: str):
+        """【主线程批量串行写入】实现单点磁盘追加，绝对规避文件读写并发冲突"""
+        # 1. 预载入现有 JSON 库防覆盖
+        existing_json_data = []
+        if os.path.exists(output_json):
             try:
-                is_duplicate, _ = self.dup_manager.is_proxy_duplicate(proxy_info)
-                if is_duplicate:
-                    stats['duplicate'] += 1
-                    self.dup_manager.update_proxy_source(proxy_info.get_fingerprint(), url)
-                else:
-                    stats['new'] += 1
-                    new_proxies.append(proxy_info)
-                    self.dup_manager.add_processed_proxy(proxy_info)
-            except Exception as e:
-                stats['error'] += 1
-                logger.error(f"分析去重运算错误: {proxy_info.name}, 细节: {e}")
+                with open(output_json, 'r', encoding='utf-8') as f:
+                    existing_json_data = json.load(f)
+            except: pass
+
+        csv_exists = os.path.exists(output_csv) and os.path.getsize(output_csv) > 0
         
-        if new_proxies:
-            self._save_proxies_to_csv(url, new_proxies, output_csv)
-            self._save_proxies_to_json(url, new_proxies, output_json)
-            self._save_proxies_to_links(new_proxies, output_links)
+        with open(output_csv, 'a', encoding='utf-8-sig', newline='') as f_csv, \
+             open(output_links, 'a', encoding='utf-8') as f_links:
+             
+            writer = csv.writer(f_csv)
+            if not csv_exists:
+                writer.writerow(['来源URL', '名称', '类型', '服务器', '端口', '加密方式', 
+                                 '密码', 'UUID', '网络协议', 'TLS', 'UDP', '提取时间', '分享链接'])
             
-        self.dup_manager.add_processed_url(url)
-        return stats
-    
-    def _save_proxies_to_csv(self, url: str, proxies: List[ProxyInfo], output_file: str):
-        try:
-            file_exists = os.path.exists(output_file) and os.path.getsize(output_file) > 0
-            with open(output_file, 'a', encoding='utf-8-sig', newline='') as f:
-                writer = csv.writer(f)
-                if not file_exists:
-                    header = ['来源URL', '名称', '类型', '服务器', '端口', '加密方式', 
-                            '密码', 'UUID', '网络协议', 'TLS', 'UDP', '提取时间', '分享链接']
-                    writer.writerow(header)
+            for url, proxies in valid_results:
+                new_proxies_for_this_url = []
                 
                 for p in proxies:
-                    writer.writerow([
-                        url, p.name, p.type, p.server, str(p.port), p.cipher,
-                        p.password, p.uuid, p.network, str(p.tls), str(p.udp),
-                        time.strftime('%Y-%m-%d %H:%M:%S'), p.to_share_link()
-                    ])
-        except Exception as e:
-            logger.error(f"增量写入保存 CSV 格式错误: {e}")
-            
-    def _save_proxies_to_json(self, url: str, proxies: List[ProxyInfo], output_file: str):
-        try:
-            all_data = []
-            if os.path.exists(output_file):
-                try:
-                    with open(output_file, 'r', encoding='utf-8') as f:
-                        all_data = json.load(f)
-                except: pass
-            
-            for p in proxies:
-                proxy_data = p.to_dict()
-                proxy_data['fingerprint'] = p.get_fingerprint()
-                proxy_data['timestamp'] = time.strftime('%Y-%m-%d %H:%M:%S')
-                proxy_data['share_link'] = p.to_share_link()
-                proxy_data['xray_config'] = p.to_xray_outbound()
-                all_data.append(proxy_data)
-            
-            with open(output_file, 'w', encoding='utf-8') as f:
-                json.dump(all_data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.error(f"追加写入保存 JSON 数据模型错误: {e}")
+                    is_duplicate, _ = self.dup_manager.is_proxy_duplicate(p)
+                    if is_duplicate:
+                        self.dup_manager.update_proxy_source(p.get_fingerprint(), url)
+                    else:
+                        new_proxies_for_this_url.append(p)
+                        self.dup_manager.add_processed_proxy(p)
 
-    def _save_proxies_to_links(self, proxies: List[ProxyInfo], output_file: str):
+                # 写入该 URL 贡献的去重全新节点
+                for p in new_proxies_for_this_url:
+                    # CSV 追加
+                    writer.writerow([url, p.name, p.type, p.server, str(p.port), p.cipher,
+                                     p.password, p.uuid, p.network, str(p.tls), str(p.udp),
+                                     time.strftime('%Y-%m-%d %H:%M:%S'), p.to_share_link()])
+                    # 纯链路追加
+                    f_links.write(f"{p.to_share_link()}\n")
+                    
+                    # 汇编 JSON 对象
+                    proxy_data = p.to_dict()
+                    proxy_data['fingerprint'] = p.get_fingerprint()
+                    proxy_data['timestamp'] = time.strftime('%Y-%m-%d %H:%M:%S')
+                    proxy_data['share_link'] = p.to_share_link()
+                    proxy_data['xray_config'] = p.to_xray_outbound()
+                    existing_json_data.append(proxy_data)
+                    
+                self.dup_manager.add_processed_url(url)
+                if new_proxies_for_this_url:
+                    logger.info(f"💾 数据持久化完成 ── 源 {url} 成功录入全新节点 {len(new_proxies_for_this_url)} 个")
+
+        # 重写更新整个 JSON 文件结构
         try:
-            with open(output_file, 'a', encoding='utf-8') as f:
-                for p in proxies:
-                    f.write(f"{p.to_share_link()}\n")
+            with open(output_json, 'w', encoding='utf-8') as f_json:
+                json.dump(existing_json_data, f_json, ensure_ascii=False, indent=2)
         except Exception as e:
-            logger.error(f"追加写入纯转换链接纯文本库错误: {e}")
+            logger.error(f"同步更新 JSON 全局库文件失败: {e}")
             
     def save_failed_url(self, url: str, reason: str, failed_file: str):
         try:
             with open(failed_file, 'a', encoding='utf-8') as f:
                 f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | {url} | {reason}\n")
-        except Exception as e:
-            logger.error(f"记录异常追踪日志失败: {e}")
+        except:
+            pass
     
     def process_urls(self, input_file: str, output_csv: str = 'all_proxies.csv', 
                      output_json: str = 'all_proxies.json', output_links: str = 'all_links.txt',
                      failed_log: str = 'failed_urls.txt'):
-        logger.info("⚡ 自动化多流智能节点采集与格式转换流水线正式启动...")
+        logger.info(f"⚡ 自动化并发节点采集流水线正式启动... 并发线程池数: {self.max_workers}")
         urls = self.read_url_list(input_file)
         if not urls: return
         
-        overall_stats = {'total_urls': len(urls), 'processed_urls': 0, 'failed_urls': 0, 'new_proxies': 0, 'duplicate_proxies': 0}
+        total_urls = len(urls)
+        fetched_contents: Dict[str, str] = {}
+        failed_tracker: List[Tuple[str, str]] = []
         
-        for idx, url in enumerate(urls, 1):
-            logger.info(f"⏳ 流水线当前进度 ── [{idx}/{len(urls)}] ── {url}")
+        # ✨【高能多线程核心】：使用并发线程池抓取网络数据
+        start_fetch_time = time.time()
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            future_to_url = {
+                executor.submit(self.fetch_single_url_worker, url, f"{i}/{total_urls}"): url 
+                for i, url in enumerate(urls, 1)
+            }
             
-            config_content = self.get_config_from_url(url)
-            if not config_content:
-                overall_stats['failed_urls'] += 1
-                self.save_failed_url(url, "网络死链/协议不可连/内容格式不属于有效YAML", failed_log)
-                continue
-            
-            proxies = self.extract_all_proxies(config_content, url)
+            for future in as_completed(future_to_url):
+                url = future_to_url[future]
+                try:
+                    url, content, status = future.result()
+                    if status == "SUCCESS" and content:
+                        fetched_contents[url] = content
+                    elif status == "SKIP":
+                        logger.info(f"⏭️ [并发跳过] 该 URL 历史已成功解析，无需重抓: {url}")
+                    else:
+                        failed_tracker.append((url, status))
+                except Exception as e:
+                    failed_tracker.append((url, f"THREAD_EXCEPTION_{str(e)}"))
+
+        logger.info(f"⏱️ 并发网页抓取下载彻底跑完，耗时: {time.time() - start_fetch_time:.2f} 秒。开始解析节点数组...")
+
+        # 在主线程安全、无冲突地解析 YAML 并增量写入落盘
+        valid_batch_results = []
+        failed_count = len(failed_tracker)
+        
+        for url, content in fetched_contents.items():
+            proxies = self.extract_all_proxies(content, url)
             if not proxies:
-                overall_stats['failed_urls'] += 1
-                self.save_failed_url(url, "有效拉取成功，但该配置文件内部无 proxies 节点数组数据", failed_log)
+                failed_tracker.append((url, "PARSED_BUT_ZERO_PROXIES_FOUND"))
+                failed_count += 1
                 continue
+            valid_batch_results.append((url, proxies))
             
-            stats = self.save_proxies_with_dedup(url, proxies, output_csv, output_json, output_links)
-            overall_stats['new_proxies'] += stats['new']
-            overall_stats['duplicate_proxies'] += stats['duplicate']
-            overall_stats['processed_urls'] += 1
-            
-            logger.info(f"✅ 单源处理圆满完成 ──> 发现新特征节点: {stats['new']} 个，历史重复已过滤: {stats['duplicate']} 个")
+        # 记录所有的失败追踪日志
+        for url, reason in failed_tracker:
+            if reason != "SKIP":
+                self.save_failed_url(url, reason, failed_log)
+                
+        # 批量安全刷入磁盘
+        if valid_batch_results:
+            self._batch_save_proxies_to_disk(valid_batch_results, output_csv, output_json, output_links)
         
         self.dup_manager.save_processed_data()
-        logger.info(f"🏁 自动化流水线作业圆满收官! 全局结算摘要:")
-        logger.info(f"  成功收录订阅源: {overall_stats['processed_urls']}/{overall_stats['total_urls']} | 阻断不可用源: {overall_stats['failed_urls']}")
-        logger.info(f"  全局累计产出新格式节点: {overall_stats['new_proxies']} 个 | 深度清洗过滤重复节点: {overall_stats['duplicate_proxies']} 个")
+        logger.info(f"🏁 自动化流水线并发作业圆满收官!")
+        logger.info(f"  全局快报摘要 ──> 成功解析有效源: {len(valid_batch_results)}/{total_urls} | 阻塞或格式异常失效源: {failed_count}")
 
 def main():
     INPUT_FILE = "urls.txt"
-    OUTPUT_CSV = "all_proxies.csv"
-    OUTPUT_JSON = "all_proxies.json"
-    OUTPUT_LINKS = "all_links.txt"
-    FAILED_LOG = "failed_urls.txt"
+    OUTPUT_CSV = os.path.join(OUTPUT_DIR, "all_proxies.csv")
+    OUTPUT_JSON = os.path.join(OUTPUT_DIR, "all_proxies.json")
+    OUTPUT_LINKS = os.path.join(OUTPUT_DIR, "all_links.txt")
+    FAILED_LOG = os.path.join(OUTPUT_DIR, "failed_urls.txt")
     
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
     processor = YAMLConfigProcessor(
         timeout=20,
         retry_count=2,
         verify_ssl=False,        
         follow_redirects=True,    
-        skip_processed_urls=True  
+        skip_processed_urls=True,
+        max_workers=15  # 🛠️ 在这里调整并发抓取的线程数量，默认15并发
     )
     
     processor.process_urls(
@@ -811,6 +769,8 @@ def main():
     )
 
 if __name__ == "__main__":
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(LOG_DIR, exist_ok=True)
     if not os.path.exists("urls.txt"):
         with open("urls.txt", "w", encoding="utf-8") as f:
             f.write("# 在此填入订阅源链接，每行一个\n")
