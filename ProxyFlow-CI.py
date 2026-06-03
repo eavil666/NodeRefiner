@@ -20,6 +20,12 @@ OUTPUT_DIR = 'output'
 LOG_DIR = 'logs'
 os.makedirs(LOG_DIR, exist_ok=True)
 
+
+def safe_quote(value: Any, safe: str = '') -> str:
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode('utf-8', errors='replace')
+    return quote(str(value), safe=safe)
+
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
@@ -98,7 +104,7 @@ class ProxyInfo:
     def to_share_link(self) -> str:
         """将自身属性转换为标准客户端一键导入分享链接"""
         ptype = self.type.lower()
-        name_encoded = quote(self.name)
+        name_encoded = safe_quote(self.name)
         
         if ptype in ['hysteria2', 'hy2']:
             params = {}
@@ -140,7 +146,7 @@ class ProxyInfo:
             if self.path: params['path'] = self.path
             if self.obfs_host: params['host'] = self.obfs_host
             query = '&'.join([f"{k}={quote(str(v))}" for k, v in params.items() if v])
-            return f"mieru://{quote(self.password)}@{self.server}:{self.port}" + (f"?{query}" if query else "") + f"#{name_encoded}"
+            return f"mieru://{safe_quote(self.password)}@{self.server}:{self.port}" + (f"?{query}" if query else "") + f"#{name_encoded}"
 
         elif ptype == 'tuic':
             params = {
