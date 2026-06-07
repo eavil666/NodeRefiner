@@ -367,9 +367,22 @@ class YAMLConfigProcessor:
         return session
     
     def normalize_url(self, url: str) -> str:
-        if not url: return url
-        parsed = urlparse(url)
-        return url if parsed.scheme else f"http://{url}"
+        if not url:
+            return url
+        url = url.strip()
+        if not url:
+            return url
+
+        lower_url = url.lower()
+        if lower_url.startswith(('http://', 'https://', 'ftp://', 'ws://', 'wss://')):
+            return url
+
+        if ';' in url:
+            parts = url.split('/', 1)
+            parts[0] = parts[0].replace(';', ':', 1)
+            url = parts[0] + ('/' + parts[1] if len(parts) > 1 else '')
+
+        return url
     
     def is_yaml_content(self, content: str) -> bool:
         if not content or not content.strip(): return False
@@ -395,53 +408,57 @@ class YAMLConfigProcessor:
             return url, None, "SKIP"
             
         normalized_url = self.normalize_url(url)
-        current_verify = self.verify_ssl
-        backoff_delay = 1.5  
-        session = self._create_thread_session(current_verify)
-        
-        for attempt in range(self.retry_count + 1):
-            try:
-                current_timeout = self.timeout if attempt > 0 else 5.0
-                logger.info(f"🔍 [{index_str}][尝试 {attempt + 1}/{self.retry_count + 1}] 正在智能抓取: {normalized_url}")
-                
-                probe = session.head(
-                    normalized_url, 
-                    timeout=current_timeout,
-                    allow_redirects=self.follow_redirects
-                )
-                
-                if probe.status_code in [404, 410, 502, 504] and attempt == self.retry_count:
-                    return url, None, f"HTTP_{probe.status_code}"
-                
-                response = session.get(
-                    normalized_url, 
-                    timeout=self.timeout,
-                    allow_redirects=self.follow_redirects
-                )
-                
-                if response.status_code == 200:
-                    content = response.text
-                    if self.is_yaml_content(content):
-                        return url, content, "SUCCESS"
-                    
-                    cleaned = self.clean_content(content)
-                    if self.is_yaml_content(cleaned):
-                        return url, cleaned, "SUCCESS"
-                    
-                    return url, None, "INVALID_YAML_FORMAT"
+        original_has_scheme = bool(urlparse(url.strip()).scheme)
+        backoff_delay = 1.5
+        session = self._create_thread_session(self.verify_ssl)
+        candidate_urls = [normalized_url]
 
-            except requests.exceptions.SSLError:
-                if current_verify:
-                    current_verify = False
-                    session.verify = False
+        if not original_has_scheme:
+            candidate_urls = [f"https://{normalized_url}", f"http://{normalized_url}"]
+
+        for attempt in range(self.retry_count + 1):
+            for candidate_url in candidate_urls:
+                try:
+                    current_timeout = self.timeout if attempt > 0 else 5.0
+                    logger.info(f"🔍 [{index_str}][尝试 {attempt + 1}/{self.retry_count + 1}] 正在智能抓取: {candidate_url}")
+                    
+                    probe = session.head(
+                        candidate_url,
+                        timeout=current_timeout,
+                        allow_redirects=self.follow_redirects
+                    )
+                    
+                    if probe.status_code in [404, 410, 502, 504]:
+                        if candidate_url == candidate_urls[-1] and attempt == self.retry_count:
+                            return url, None, f"HTTP_{probe.status_code}"
+                        continue
+                    
+                    response = session.get(
+                        candidate_url,
+                        timeout=self.timeout,
+                        allow_redirects=self.follow_redirects
+                    )
+                    
+                    if response.status_code == 200:
+                        content = response.text
+                        if self.is_yaml_content(content):
+                            return url, content, "SUCCESS"
+                        
+                        cleaned = self.clean_content(content)
+                        if self.is_yaml_content(cleaned):
+                            return url, cleaned, "SUCCESS"
+                        
+                        return url, None, "INVALID_YAML_FORMAT"
+
+                except requests.exceptions.SSLError:
+                    if session.verify:
+                        session.verify = False
+                        continue
+                except requests.exceptions.Timeout:
                     continue
-            except requests.exceptions.Timeout:
-                pass
-            except requests.exceptions.RequestException:
-                if normalized_url.startswith('https://'):
-                    normalized_url = normalized_url.replace('https://', 'http://')
+                except requests.exceptions.RequestException:
                     continue
-            
+
             if attempt < self.retry_count:
                 time.sleep(backoff_delay * (1.2 ** attempt))
                 
@@ -616,8 +633,10 @@ class YAMLConfigProcessor:
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 for line in f:
-                    line = line.strip()
-                    if line and not line.startswith('#'): urls.append(line)
+                    raw_line = line.strip()
+                    if not raw_line or raw_line.startswith('#'):
+                        continue
+                    urls.append(raw_line)
             logger.info(f"成功导入订阅源配置文件，获取待刷入 URL 共: {len(urls)} 条")
         except Exception as e:
             logger.error(f"无法正确读取 URL 载入配置文件: {e}")
