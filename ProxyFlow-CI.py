@@ -657,7 +657,12 @@ class YAMLConfigProcessor:
         with open(output_csv, 'a', encoding='utf-8-sig', newline='') as f_csv, \
              open(output_links, 'a', encoding='utf-8') as f_links:
              
-            writer = csv.writer(f_csv)
+            writer = csv.writer(
+                f_csv,
+                quoting=csv.QUOTE_MINIMAL,
+                escapechar='\\',
+                doublequote=True,
+            )
             if not csv_exists:
                 writer.writerow(['来源URL', '名称', '类型', '服务器', '端口', '加密方式', 
                                  '密码', 'UUID', '网络协议', 'TLS', 'UDP', '提取时间', '分享链接'])
